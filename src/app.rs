@@ -1,4 +1,4 @@
-use crate::annot::{self, Annot, Kind, Prim, Rgb};
+use crate::annot::{self, Annot, Kind, Look, Prim, Rgb};
 use crate::render::{ExportMode, Layer, Req, Resp, Worker};
 use crate::sidecar;
 use crate::stamps;
@@ -36,7 +36,7 @@ enum Pick {
     Images(stamps::Use),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Tool {
     Select,
     Callout,
@@ -56,6 +56,82 @@ impl Tool {
     fn measures(self) -> bool {
         matches!(self, Tool::Distance | Tool::Area | Tool::Perimeter)
     }
+
+    /// Whether what this tool draws can take a fill.
+    fn fills(self) -> bool {
+        matches!(self, Tool::Callout | Tool::Text | Tool::Cloud | Tool::Rect | Tool::Area | Tool::Perimeter)
+    }
+
+    fn name(self) -> &'static str {
+        TOOLS.iter().chain(MEASURE_TOOLS.iter()).find(|(t, ..)| *t == self).map(|(_, n, _)| *n).unwrap_or("Select")
+    }
+
+    /// The tool that draws `kind` (None for stamps).
+    fn for_kind(kind: &Kind) -> Option<Tool> {
+        Some(match kind {
+            Kind::Callout { .. } => Tool::Callout,
+            Kind::Text { .. } => Tool::Text,
+            Kind::Cloud { .. } => Tool::Cloud,
+            Kind::Rect { .. } => Tool::Rect,
+            Kind::Highlight { .. } => Tool::Highlight,
+            Kind::Arrow { .. } => Tool::Arrow,
+            Kind::Line { .. } => Tool::Line,
+            Kind::Pen { .. } => Tool::Pen,
+            Kind::Distance { .. } => Tool::Distance,
+            Kind::Area { .. } => Tool::Area,
+            Kind::Perimeter { .. } => Tool::Perimeter,
+            Kind::Image { .. } => return None,
+        })
+    }
+
+    /// Opacity and fill a tool starts with: no fill, and a chosen fill is solid
+    /// in text boxes but see-through over drawings.
+    fn default_look(self) -> Look {
+        Look { fill_opacity: if matches!(self, Tool::Callout | Tool::Text) { 1.0 } else { 0.4 }, ..Look::default() }
+    }
+}
+
+/// One saved tool setup in the favorites bar (F + 1-9).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Favorite {
+    /// Shown in the bar; empty = described from the settings.
+    #[serde(default)]
+    pub name: String,
+    pub tool: Tool,
+    pub color: Rgb,
+    pub width: f32,
+    pub text_size: f32,
+    #[serde(default)]
+    pub look: Look,
+}
+
+pub const FAVORITES: usize = 9;
+const FAV_KEYS: [Key; FAVORITES] = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9];
+
+impl Favorite {
+    /// "Red Pen 12 pt", "Red Callout 18 pt · yellow fill · 50%".
+    fn describe(&self) -> String {
+        if !self.name.trim().is_empty() {
+            return self.name.trim().to_string();
+        }
+        let colour = colour_name(self.color);
+        let size = match self.tool {
+            Tool::Callout | Tool::Text | Tool::Distance | Tool::Area | Tool::Perimeter => format!("{} pt", self.text_size),
+            _ => format!("{} pt", self.width),
+        };
+        let mut s = format!("{colour} {} {size}", self.tool.name());
+        if let Some(f) = self.look.fill.filter(|_| self.tool.fills()) {
+            s += &format!(" · {} fill", colour_name(f).to_lowercase());
+        }
+        if self.look.opacity < 1.0 {
+            s += &format!(" · {:.0}%", self.look.opacity * 100.0);
+        }
+        s
+    }
+}
+
+fn colour_name(c: Rgb) -> &'static str {
+    COLORS.iter().chain(std::iter::once(&(annot::WHITE, "White"))).find(|(x, _)| *x == c).map(|(_, n)| *n).unwrap_or("Custom")
 }
 
 /// Measurement tools take Shift + their key, so A/L/P stay arrow/line/pen.
@@ -230,6 +306,12 @@ pub struct App {
     measuring: Option<(usize, Vec<Pos2>)>,
     /// Shift held: measuring snaps to horizontal / vertical.
     ortho: bool,
+    /// Opacity and fill per tool (`Tool::default_look` until changed).
+    tool_look: HashMap<Tool, Look>,
+    /// A number was pressed while F was held, so F's release isn't "fit page".
+    f_chord: bool,
+    /// Favorite being renamed, and the name so far.
+    fav_renaming: Option<(usize, String)>,
     status: String,
     status_until: f64,
 
@@ -349,6 +431,9 @@ impl App {
             title: String::new(),
             measuring: None,
             ortho: false,
+            tool_look: HashMap::new(),
+            f_chord: false,
+            fav_renaming: None,
             status,
             status_until: f64::INFINITY,
             path: None,
@@ -1124,6 +1209,10 @@ impl App {
         COLORS[self.color_idx(self.tool)].0
     }
 
+    fn look(&self) -> Look {
+        self.tool_look.get(&self.tool).copied().unwrap_or_else(|| self.tool.default_look())
+    }
+
     fn color_idx(&self, tool: Tool) -> usize {
         *self.tool_color.get(&tool).unwrap_or(&DEFAULT_COLOR)
     }
@@ -1131,7 +1220,7 @@ impl App {
     fn add(&mut self, page: usize, kind: Kind) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        self.annots.push(Annot { id, page, color: self.color(), width: self.width, kind, wrap_w: None, group: None });
+        self.annots.push(Annot { id, page, color: self.color(), width: self.width, kind, wrap_w: None, group: None, look: self.look() });
         self.changed();
         id
     }
@@ -1368,7 +1457,7 @@ impl App {
     }
 
     fn set_width(&mut self, w: f32) {
-        self.width = w.clamp(0.5, 12.0);
+        self.width = w.clamp(0.5, 36.0);
         let w = self.width;
         self.edit_selected(|a| a.width = w);
     }
@@ -1389,6 +1478,165 @@ impl App {
                     *size = s;
                 }
             });
+        }
+    }
+
+    /// Changes the current tool's opacity / fill and the same on every selected markup.
+    fn set_look(&mut self, f: impl Fn(&mut Look)) {
+        let mut l = self.look();
+        f(&mut l);
+        self.tool_look.insert(self.tool, l);
+        self.edit_selected(|a| f(&mut a.look));
+    }
+
+    /// What the toolbar shows: the lead selected markup's look, else the tool's.
+    fn shown_look(&self) -> Look {
+        self.lead().map(|a| a.look).unwrap_or_else(|| self.look())
+    }
+
+    // -----------------------------------------------------------------------
+    // Favorites
+
+    fn favorite(&self, i: usize) -> Option<&Favorite> {
+        self.prefs.favorites.get(i)?.as_ref()
+    }
+
+    /// The setup to save: the selected markup's, or else the current tool's.
+    fn current_favorite(&self) -> Option<Favorite> {
+        if let Some(a) = self.lead() {
+            let tool = Tool::for_kind(&a.kind)?;
+            let text_size = a.clone().label_size_mut().map(|s| *s).unwrap_or(self.text_size);
+            return Some(Favorite { name: String::new(), tool, color: a.color, width: a.width, text_size, look: a.look });
+        }
+        if self.tool == Tool::Select {
+            return None;
+        }
+        Some(Favorite { name: String::new(), tool: self.tool, color: self.color(), width: self.width, text_size: self.text_size, look: self.look() })
+    }
+
+    fn save_favorite(&mut self, i: usize) {
+        let Some(f) = self.current_favorite() else {
+            self.toast("Pick a tool (or select a markup) first, then save it as a favorite".into());
+            return;
+        };
+        let mut f = f;
+        // Replacing keeps a name the user gave it.
+        if let Some(old) = self.favorite(i) {
+            f.name = old.name.clone();
+        }
+        self.toast(format!("Favorite {}: {}", i + 1, f.describe()));
+        self.prefs.favorites.resize(FAVORITES, None);
+        self.prefs.favorites[i] = Some(f);
+        self.prefs_dirty = true;
+    }
+
+    fn apply_favorite(&mut self, i: usize) {
+        let Some(f) = self.favorite(i).cloned() else {
+            self.toast(format!("Favorite {} is empty: click its slot on the right to save the current tool there", i + 1));
+            return;
+        };
+        self.set_tool(f.tool);
+        if let Some(c) = COLORS.iter().position(|(c, _)| *c == f.color) {
+            self.tool_color.insert(f.tool, c);
+        }
+        self.width = f.width;
+        self.text_size = f.text_size;
+        self.tool_look.insert(f.tool, f.look);
+        self.toast(format!("Favorite {}: {}", i + 1, f.describe()));
+    }
+
+    /// Whether favorite `f` is what the tools are set to now.
+    fn favorite_active(&self, f: &Favorite) -> bool {
+        self.tool == f.tool && self.color() == f.color && self.width == f.width && self.look() == f.look && (self.text_size == f.text_size || !matches!(f.tool, Tool::Callout | Tool::Text) && !f.tool.measures())
+    }
+
+    fn favorites_bar(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.strong("Favorites");
+            ui.weak("F + 1–9");
+        });
+        ui.separator();
+        self.prefs.favorites.resize(FAVORITES, None);
+        let mut action: Option<(usize, u8)> = None; // 0 apply, 1 save, 2 clear, 3 rename
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            for i in 0..FAVORITES {
+                let fav = self.prefs.favorites[i].clone();
+                let w = ui.available_width();
+                let (rect, resp) = ui.allocate_exact_size(vec2(w, 44.0), Sense::click());
+                let active = fav.as_ref().is_some_and(|f| self.favorite_active(f));
+                if active || resp.hovered() {
+                    let bg = if active { ui.visuals().selection.bg_fill } else { ui.visuals().widgets.hovered.weak_bg_fill };
+                    ui.painter().rect_filled(rect, 4.0, bg);
+                }
+                let p = ui.painter();
+                p.text(pos2(rect.min.x + 8.0, rect.center().y), Align2::LEFT_CENTER, (i + 1).to_string(), FontId::proportional(13.0), ui.visuals().weak_text_color());
+                let swatch = Rect::from_min_size(pos2(rect.min.x + 22.0, rect.min.y + 6.0), vec2(32.0, 32.0));
+                let name_rect = Rect::from_min_max(pos2(swatch.max.x + 6.0, rect.min.y + 2.0), pos2(rect.max.x - 4.0, rect.max.y - 2.0));
+                match &fav {
+                    Some(f) => {
+                        paint_favorite_swatch(p, swatch, f);
+                        if let Some((_, buf)) = self.fav_renaming.as_mut().filter(|(r, _)| *r == i) {
+                            let edit = ui.put(Rect::from_center_size(name_rect.center(), vec2(name_rect.width(), 20.0)), egui::TextEdit::singleline(buf).hint_text(f.describe()));
+                            if edit.lost_focus() {
+                                action = Some((i, 3));
+                            } else if !edit.has_focus() {
+                                edit.request_focus();
+                            }
+                        } else {
+                            let colour = ui.visuals().text_color();
+                            let mut job = egui::text::LayoutJob::simple(f.describe(), FontId::proportional(12.0), colour, name_rect.width());
+                            job.wrap.max_rows = 2;
+                            job.wrap.overflow_character = Some('…');
+                            let g = ui.painter().layout_job(job);
+                            ui.painter().galley(pos2(name_rect.min.x, rect.center().y - g.size().y / 2.0), g, colour);
+                        }
+                    }
+                    None => {
+                        let stroke = Stroke::new(1.0, ui.visuals().weak_text_color());
+                        p.rect_stroke(swatch.shrink(2.0), 4.0, stroke, egui::StrokeKind::Inside);
+                        p.text(swatch.center(), Align2::CENTER_CENTER, "+", FontId::proportional(16.0), ui.visuals().weak_text_color());
+                        p.text(pos2(name_rect.min.x, rect.center().y), Align2::LEFT_CENTER, "Save current", FontId::proportional(12.0), ui.visuals().weak_text_color());
+                    }
+                }
+                let tip = if fav.is_some() { "Click (or F + number) to use it · right-click to replace, rename or clear" } else { "Click to save the current tool, colour, line, text size, opacity and fill here (or a selected markup's)" };
+                let resp = resp.on_hover_text(tip);
+                if resp.clicked() {
+                    action = Some((i, if fav.is_some() { 0 } else { 1 }));
+                }
+                if fav.is_some() {
+                    resp.context_menu(|ui| {
+                        if ui.button("Replace with current settings").clicked() {
+                            action = Some((i, 1));
+                            ui.close();
+                        }
+                        if ui.button("Rename").clicked() {
+                            self.fav_renaming = Some((i, fav.as_ref().map(|f| f.name.clone()).unwrap_or_default()));
+                            ui.close();
+                        }
+                        if ui.button("Clear").clicked() {
+                            action = Some((i, 2));
+                            ui.close();
+                        }
+                    });
+                }
+            }
+            ui.add_space(8.0);
+            ui.weak("Set up a tool (colour, line, text size, opacity, fill), then click an empty slot. Right-click a slot to replace it.");
+        });
+        match action {
+            Some((i, 0)) => self.apply_favorite(i),
+            Some((i, 1)) => self.save_favorite(i),
+            Some((i, 2)) => {
+                self.prefs.favorites[i] = None;
+                self.prefs_dirty = true;
+            }
+            Some((i, 3)) => {
+                if let (Some((_, name)), Some(Some(f))) = (self.fav_renaming.take(), self.prefs.favorites.get_mut(i)) {
+                    f.name = name.trim().to_string();
+                    self.prefs_dirty = true;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1591,6 +1839,23 @@ impl App {
         if pressed(Key::I) {
             self.toggle_right_panel(true);
         }
+        // Hold F and press 1-9 for a favorite; F tapped alone still fits the page (on release).
+        let f_held = ctx.input(|i| i.key_down(Key::F));
+        let f_down = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { key: Key::F, pressed: true, repeat: false, .. })));
+        if f_down {
+            self.f_chord = false;
+        }
+        if f_held {
+            for (n, k) in FAV_KEYS.iter().enumerate() {
+                if pressed(*k) {
+                    self.apply_favorite(n);
+                    self.f_chord = true;
+                }
+            }
+        }
+        if ctx.input(|i| i.key_released(Key::F)) && !std::mem::replace(&mut self.f_chord, false) {
+            self.fit_page();
+        }
         for (t, _, k) in TOOLS {
             if pressed(k) && !shift {
                 self.set_tool(t);
@@ -1634,7 +1899,7 @@ impl App {
             }
         }
         for (i, k) in COLOR_KEYS.iter().enumerate() {
-            if pressed(*k) {
+            if pressed(*k) && !f_held {
                 self.set_color(i);
             }
         }
@@ -1655,9 +1920,6 @@ impl App {
         }
         if pressed(Key::W) {
             self.fit_width();
-        }
-        if pressed(Key::F) {
-            self.fit_page();
         }
         if pressed(Key::G) {
             self.goto = Some(String::new());
@@ -2250,12 +2512,12 @@ impl App {
                 Drag::Create { page, start, cur } if *page == i => {
                     let preview = self.preview_kind(*start, *cur);
                     if let Some(kind) = preview {
-                        let a = Annot { id: 0, page: i, color: self.color(), width: self.width, kind, wrap_w: None, group: None };
+                        let a = Annot { id: 0, page: i, color: self.color(), width: self.width, kind, wrap_w: None, group: None, look: self.look() };
                         paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &a.prims(), k, 0.7, &self.textures);
                     }
                 }
                 Drag::Pen { page, pts } if *page == i => {
-                    let a = Annot { id: 0, page: i, color: self.color(), width: self.width, kind: Kind::Pen { pts: pts.clone() }, wrap_w: None, group: None };
+                    let a = Annot { id: 0, page: i, color: self.color(), width: self.width, kind: Kind::Pen { pts: pts.clone() }, wrap_w: None, group: None, look: self.look() };
                     paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &a.prims(), k, 1.0, &self.textures);
                 }
                 Drag::Marquee { page, start, cur } if *page == i => {
@@ -2268,7 +2530,7 @@ impl App {
             if let Some((page, pts)) = self.measuring.as_ref().filter(|(pg, _)| *pg == i) {
                 let hover = self.hover.filter(|h| self.page_at(*h) == Some(*page)).map(|h| self.snap(self.screen_to_page(*page, h)));
                 if let Some(kind) = self.measure_kind(pts, hover, false) {
-                    let a = Annot { id: 0, page: i, color: self.color(), width: self.width, kind, wrap_w: None, group: None };
+                    let a = Annot { id: 0, page: i, color: self.color(), width: self.width, kind, wrap_w: None, group: None, look: self.look() };
                     paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &a.prims(), k, 0.8, &self.textures);
                 }
                 for (n, p) in pts.iter().enumerate() {
@@ -2286,7 +2548,7 @@ impl App {
                 };
                 if let Some((start, cur)) = at {
                     let color = if matches!(place, Place::Date) { DATE_COLOR } else { self.color() };
-                    let a = Annot { id: 0, page: i, color, width: self.width, kind: self.placed_kind(place, start, cur), wrap_w: None, group: None };
+                    let a = Annot { id: 0, page: i, color, width: self.width, kind: self.placed_kind(place, start, cur), wrap_w: None, group: None, look: Look::default() };
                     paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &a.prims(), k, 0.6, &self.textures);
                     let b = a.bounds();
                     pp.rect_stroke(Rect::from_min_max(self.page_to_screen(i, b.min), self.page_to_screen(i, b.max)), 0.0, Stroke::new(1.0, SEL), egui::StrokeKind::Outside);
@@ -2482,7 +2744,7 @@ impl App {
             ui.separator();
             ui.label("Line");
             let mut w = self.width;
-            if ui.add(egui::DragValue::new(&mut w).range(0.5..=12.0).speed(0.1).suffix(" pt")).on_hover_text("[ / ]").changed() {
+            if ui.add(egui::DragValue::new(&mut w).range(0.5..=36.0).speed(0.1).suffix(" pt")).on_hover_text("[ / ]").changed() {
                 self.set_width(w);
             }
             ui.label("Text");
@@ -2495,6 +2757,45 @@ impl App {
                 }
             });
             ui.separator();
+            let look = self.shown_look();
+            ui.label("Opacity");
+            let mut op = look.opacity * 100.0;
+            if ui.add(egui::DragValue::new(&mut op).range(10.0..=100.0).speed(1.0).max_decimals(0).suffix("%")).on_hover_text("Whole markup (applies to all selected)").changed() {
+                self.set_look(|l| l.opacity = op / 100.0);
+            }
+            let can_fill = self.tool.fills() || self.annots.iter().any(|a| self.selected.contains(&a.id) && a.kind.fills());
+            ui.add_enabled_ui(can_fill, |ui| {
+                ui.label("Fill");
+                let shown = look.fill.map(colour_name).unwrap_or("None");
+                egui::ComboBox::from_id_salt("fill")
+                    .width(70.0)
+                    .selected_text(shown)
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(look.fill.is_none(), "None").clicked() {
+                            self.set_look(|l| l.fill = None);
+                        }
+                        for (c, name) in COLORS.iter().copied().chain(std::iter::once((annot::WHITE, "White"))) {
+                            ui.horizontal(|ui| {
+                                let (r, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
+                                ui.painter().rect(r, 2.0, Color32::from_rgb(c[0], c[1], c[2]), Stroke::new(1.0, ui.visuals().weak_text_color()), egui::StrokeKind::Inside);
+                                if ui.selectable_label(look.fill == Some(c), name).clicked() {
+                                    self.set_look(|l| l.fill = Some(c));
+                                }
+                            });
+                        }
+                    })
+                    .response
+                    .on_hover_text("Fill for callouts, text boxes, rectangles, clouds and areas (applies to all selected)");
+                let mut fo = look.fill_opacity * 100.0;
+                if ui.add_enabled(look.fill.is_some(), egui::DragValue::new(&mut fo).range(5.0..=100.0).speed(1.0).max_decimals(0).suffix("%")).on_hover_text("Fill opacity").changed() {
+                    self.set_look(|l| l.fill_opacity = fo / 100.0);
+                }
+            });
+            ui.separator();
+            if ui.selectable_label(self.prefs.show_favorites, "Favorites").on_hover_text("Favorites bar on the right (F + 1–9)").clicked() {
+                self.prefs.show_favorites = !self.prefs.show_favorites;
+                self.prefs_dirty = true;
+            }
             if ui.button("?").on_hover_text("Shortcuts (F1)").clicked() {
                 self.show_help = !self.show_help;
             }
@@ -3040,6 +3341,8 @@ impl App {
                     ("Drag on empty page", "Select every markup the box crosses (Ctrl/Shift adds)   ·   Ctrl+A all on page"),
                     ("Esc / Ctrl+Enter", "Finish typing"),
                     ("1–6", "Colour (applies to all selected; new markups start red)"),
+                    ("F + 1–9", "Favorite (hold F, press the number) · click an empty slot on the right to save the current tool"),
+                    ("Opacity / Fill", "Toolbar: see-through markups, and fills for callouts, text, rectangles, clouds and areas"),
                     ("[ ]", "Line width   ·   { } text size"),
                     ("Del", "Delete selection   ·   Ctrl+D duplicate"),
                     ("Ctrl+Z / Ctrl+Shift+Z", "Undo / redo"),
@@ -3050,7 +3353,7 @@ impl App {
                     ("In overview", "Arrows move, Enter opens, Ctrl+wheel resizes, O or Esc closes"),
                     ("Wheel / Ctrl+wheel", "Scroll / zoom at cursor"),
                     ("Middle or right drag, Space+drag", "Pan"),
-                    ("W / F / G", "Fit width / fit page / go to page"),
+                    ("W / F / G", "Fit width / fit page (tap F) / go to page"),
                     ("Ctrl+O / Ctrl+W", "Open PDFs in new tabs / close the tab"),
                     ("Ctrl+Tab / Ctrl+PgDn PgUp", "Next / previous tab   ·   drag a tab off the bar (or right-click it) for a new window"),
                     ("PgUp PgDn ← →  Home End", "Previous / next page"),
@@ -3124,6 +3427,9 @@ impl eframe::App for App {
                 .show(ui, |ui| self.sidebar(ui));
         }
         self.load_textures(&ctx);
+        if self.prefs.show_favorites {
+            egui::Panel::right("favorites").resizable(true).default_size(190.0).size_range(150.0..=320.0).frame(egui::Frame::side_top_panel(ui.style()).fill(sheets)).show(ui, |ui| self.favorites_bar(ui));
+        }
         if self.show_stamps {
             egui::Panel::right("stamps").resizable(true).default_size(280.0).size_range(220.0..=600.0).frame(egui::Frame::side_top_panel(ui.style()).fill(sheets)).show(ui, |ui| self.stamp_panel(ui));
         } else if self.show_markups {
@@ -3199,8 +3505,8 @@ fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32,
     let min_w = if z < 0.3 { 0.7 } else { 1.0 };
     for prim in prims {
         match prim {
-            Prim::Stroke { pts, closed, width, color } => {
-                let s = Stroke::new((width * z).max(min_w), col(*color, 255));
+            Prim::Stroke { pts, closed, width, color, alpha } => {
+                let s = Stroke::new((width * z).max(min_w), col(*color, *alpha));
                 let pts = map(pts);
                 if *closed {
                     painter.add(Shape::closed_line(pts, s));
@@ -3210,23 +3516,40 @@ fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32,
             }
             Prim::Fill { pts, color, alpha, outline } => {
                 let stroke = outline.map(|(c, w)| Stroke::new((w * z).max(min_w), col(c, 255))).unwrap_or(Stroke::NONE);
-                painter.add(Shape::convex_polygon(map(pts), col(*color, *alpha), stroke));
+                let pts = map(pts);
+                if is_convex(&pts) {
+                    painter.add(Shape::convex_polygon(pts, col(*color, *alpha), stroke));
+                } else {
+                    // Clouds and odd-shaped areas: fill by triangles, then the outline.
+                    let mut mesh = egui::Mesh::default();
+                    let fill = col(*color, *alpha);
+                    for p in &pts {
+                        mesh.colored_vertex(*p, fill);
+                    }
+                    for t in annot::triangulate(&pts) {
+                        mesh.add_triangle(t[0] as u32, t[1] as u32, t[2] as u32);
+                    }
+                    painter.add(Shape::mesh(mesh));
+                    if stroke != Stroke::NONE {
+                        painter.add(Shape::closed_line(pts, stroke));
+                    }
+                }
             }
-            Prim::Text { origin: o, text, size, color } => {
+            Prim::Text { origin: o, text, size, color, alpha } => {
                 let fs = size * z * k.0;
                 let o = to(*o);
                 if fs < 3.0 {
                     // Too small to read: a grey bar where the line of text is.
                     let w = annot::text_width(text, *size) * z;
-                    painter.line_segment([o - vec2(0.0, fs * 0.3), o + vec2(w, -fs * 0.3)], Stroke::new(fs.max(0.7), col(*color, 120)));
+                    painter.line_segment([o - vec2(0.0, fs * 0.3), o + vec2(w, -fs * 0.3)], Stroke::new(fs.max(0.7), col(*color, (*alpha as u16 * 120 / 255) as u8)));
                     continue;
                 }
-                painter.text(o - vec2(0.0, k.1 * size * z), Align2::LEFT_TOP, text, FontId::new(fs, helv()), col(*color, 255));
+                painter.text(o - vec2(0.0, k.1 * size * z), Align2::LEFT_TOP, text, FontId::new(fs, helv()), col(*color, *alpha));
             }
-            Prim::Image { rect, image } => {
+            Prim::Image { rect, image, alpha } => {
                 let r = Rect::from_min_max(to(rect.min), to(rect.max));
                 if let Some(t) = images.get(image) {
-                    painter.image(t.id(), r, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE.gamma_multiply(alpha_mul));
+                    painter.image(t.id(), r, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE.gamma_multiply(alpha_mul * *alpha as f32 / 255.0));
                 } else {
                     // Image file missing: a crossed box, so the gap can't be missed.
                     let s = Stroke::new(1.0, Color32::from_rgb(200, 0, 0));
@@ -3237,6 +3560,57 @@ fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32,
             }
         }
     }
+}
+
+/// A small picture of a favorite: its line, or its box with fill and text size.
+fn paint_favorite_swatch(p: &Painter, r: Rect, f: &Favorite) {
+    p.rect_filled(r, 4.0, Color32::WHITE);
+    let a = |x: f32| (x * f.look.opacity * 255.0).round() as u8;
+    let c = |rgb: Rgb, al: u8| Color32::from_rgba_unmultiplied(rgb[0], rgb[1], rgb[2], al);
+    let inner = r.shrink(6.0);
+    let line = Stroke::new(f.width.clamp(1.0, 8.0), c(f.color, a(1.0)));
+    match f.tool {
+        Tool::Callout | Tool::Text => {
+            if let Some(fill) = f.look.fill {
+                p.rect_filled(inner, 1.0, c(fill, a(f.look.fill_opacity)));
+            }
+            if f.tool == Tool::Callout {
+                p.rect_stroke(inner, 1.0, Stroke::new(f.width.clamp(1.0, 3.0), c(f.color, a(1.0))), egui::StrokeKind::Inside);
+            }
+            p.text(inner.center(), Align2::CENTER_CENTER, "Aa", FontId::new((f.text_size * 0.7).clamp(8.0, 16.0), helv()), c(f.color, a(1.0)));
+        }
+        Tool::Highlight => {
+            p.rect_filled(Rect::from_center_size(inner.center(), vec2(inner.width(), 10.0)), 0.0, c(f.color, a(90.0 / 255.0)));
+        }
+        Tool::Rect | Tool::Cloud | Tool::Area | Tool::Perimeter => {
+            if let Some(fill) = f.look.fill {
+                p.rect_filled(inner, 0.0, c(fill, a(f.look.fill_opacity)));
+            }
+            p.rect_stroke(inner, 0.0, Stroke::new(f.width.clamp(1.0, 4.0), c(f.color, a(1.0))), egui::StrokeKind::Inside);
+        }
+        _ => {
+            p.line_segment([inner.left_bottom(), inner.right_top()], line);
+        }
+    }
+}
+
+fn is_convex(pts: &[Pos2]) -> bool {
+    let n = pts.len();
+    if n < 4 {
+        return true;
+    }
+    let mut sign = 0.0f32;
+    for i in 0..n {
+        let (a, b, c) = (pts[i], pts[(i + 1) % n], pts[(i + 2) % n]);
+        let cross = (b - a).x * (c - b).y - (b - a).y * (c - b).x;
+        if cross.abs() > 1e-3 {
+            if sign != 0.0 && cross.signum() != sign {
+                return false;
+            }
+            sign = cross.signum();
+        }
+    }
+    true
 }
 
 /// Default name on editable-export comments when none is set in Shortcuts:
@@ -3528,6 +3902,56 @@ mod tests {
         assert_eq!((app.tabs.len(), app.active, app.annots.len()), (1, 0, 1));
         assert!(app.close_tab(0));
         assert!(app.path.is_none() && app.annots.is_empty() && app.tabs.len() == 1, "back to an empty window");
+    }
+
+    #[test]
+    fn favorites_save_and_restore_a_tool_setup() {
+        let mut app = app();
+        app.set_tool(Tool::Callout);
+        app.set_color(5);
+        app.text_size = 18.0;
+        app.set_look(|l| l.fill = Some([255, 214, 0]));
+        app.save_favorite(2);
+        assert_eq!(app.favorite(2).unwrap().describe(), "Yellow Callout 18 pt · yellow fill");
+        app.set_tool(Tool::Pen);
+        app.width = 12.0;
+        app.save_favorite(0);
+        assert_eq!(app.favorite(0).unwrap().describe(), "Red Pen 12 pt");
+
+        app.set_tool(Tool::Select);
+        app.text_size = 10.0;
+        app.apply_favorite(2);
+        assert_eq!((app.tool, app.color(), app.text_size), (Tool::Callout, COLORS[5].0, 18.0));
+        assert_eq!(app.look().fill, Some([255, 214, 0]));
+        let id = app.add(0, Kind::Text { pos: pos2(10.0, 10.0), box_w: 100.0, text: "x".into(), size: 18.0 });
+        assert_eq!(app.find(id).unwrap().look.fill, Some([255, 214, 0]), "new markups take the tool's fill");
+        app.apply_favorite(0);
+        assert_eq!((app.tool, app.width, app.color()), (Tool::Pen, 12.0, [228, 0, 0]));
+        app.apply_favorite(5);
+        assert_eq!(app.tool, Tool::Pen, "empty slot changes nothing");
+
+        // From a selected markup: its settings, not the tool's.
+        let r = rect(&mut app, 300.0, 300.0);
+        app.find_mut(r).unwrap().look.opacity = 0.5;
+        app.set_tool(Tool::Select);
+        app.selected = vec![r];
+        app.save_favorite(8);
+        let f = app.favorite(8).unwrap();
+        assert_eq!((f.tool, f.look.opacity), (Tool::Rect, 0.5));
+    }
+
+    #[test]
+    fn opacity_and_fill_apply_to_selection_as_one_step() {
+        let mut app = app();
+        let (a, b) = (rect(&mut app, 100.0, 100.0), rect(&mut app, 300.0, 300.0));
+        app.selected = vec![a, b];
+        app.set_look(|l| {
+            l.opacity = 0.6;
+            l.fill = Some([0, 88, 220]);
+        });
+        assert!(app.annots.iter().all(|x| x.look.opacity == 0.6 && x.look.fill == Some([0, 88, 220])));
+        app.undo();
+        assert!(app.annots.iter().all(|x| x.look.opacity == 1.0 && x.look.fill.is_none()));
     }
 
     #[test]

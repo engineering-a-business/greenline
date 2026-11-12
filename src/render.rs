@@ -240,13 +240,13 @@ fn color(c: Rgb, a: u8) -> PdfColor {
     PdfColor::new(c[0], c[1], c[2], a)
 }
 
-fn path_object<'a>(doc: &PdfDocument<'a>, pts: &[Pos2], closed: bool, stroke: Option<(Rgb, f32)>, fill: Option<PdfColor>) -> anyhow::Result<PdfPagePathObject<'a>> {
+fn path_object<'a>(doc: &PdfDocument<'a>, pts: &[Pos2], closed: bool, stroke: Option<(PdfColor, f32)>, fill: Option<PdfColor>) -> anyhow::Result<PdfPagePathObject<'a>> {
     let p0 = pts[0];
     let mut obj = PdfPagePathObject::new(
         doc,
         PdfPoints::new(p0.x),
         PdfPoints::new(p0.y),
-        stroke.map(|(c, _)| color(c, 255)),
+        stroke.map(|(c, _)| c),
         stroke.map(|(_, w)| PdfPoints::new(w)),
         fill,
     )?;
@@ -336,16 +336,20 @@ fn load_images(annots: &[Annot]) -> anyhow::Result<HashMap<String, image::RgbaIm
 /// (cached, since a stamp copied to every sheet has the same size on each).
 struct Images<'i> {
     src: &'i HashMap<String, image::RgbaImage>,
-    scaled: HashMap<(String, u32, u32), image::DynamicImage>,
+    scaled: HashMap<(String, u32, u32, u8), image::DynamicImage>,
 }
 
 impl Images<'_> {
-    fn get(&mut self, name: &str, size_pt: Vec2) -> anyhow::Result<&image::DynamicImage> {
+    /// `name` scaled for `size_pt`, its alpha channel multiplied by `alpha`/255 for a see-through stamp.
+    fn get(&mut self, name: &str, size_pt: Vec2, alpha: u8) -> anyhow::Result<&image::DynamicImage> {
         let img = self.src.get(name).ok_or_else(|| anyhow::anyhow!("image {name} not loaded"))?;
         let k = (size_pt.x.max(size_pt.y) / 72.0 * IMAGE_DPI / img.width().max(img.height()) as f32).min(1.0);
         let (w, h) = (((img.width() as f32 * k).round() as u32).max(1), ((img.height() as f32 * k).round() as u32).max(1));
-        Ok(self.scaled.entry((name.to_string(), w, h)).or_insert_with(|| {
-            let img = if (w, h) == img.dimensions() { img.clone() } else { image::imageops::resize(img, w, h, image::imageops::FilterType::Lanczos3) };
+        Ok(self.scaled.entry((name.to_string(), w, h, alpha)).or_insert_with(|| {
+            let mut img = if (w, h) == img.dimensions() { img.clone() } else { image::imageops::resize(img, w, h, image::imageops::FilterType::Lanczos3) };
+            if alpha < 255 {
+                img.pixels_mut().for_each(|p| p[3] = (p[3] as u16 * alpha as u16 / 255) as u8);
+            }
             image::DynamicImage::ImageRgba8(img)
         }))
     }
@@ -373,18 +377,18 @@ fn emit_prims<'a>(
     let k = m.u.length();
     for prim in prims {
         match prim {
-            Prim::Stroke { pts, closed, width, color: c } if pts.len() >= 2 => {
+            Prim::Stroke { pts, closed, width, color: c, alpha } if pts.len() >= 2 => {
                 let pts: Vec<Pos2> = pts.iter().map(|p| m.map(*p)).collect();
-                let obj = path_object(doc, &pts, closed, Some((c, width * k)), None)?;
+                let obj = path_object(doc, &pts, closed, Some((color(c, alpha), width * k)), None)?;
                 objects.add_path_object(obj)?;
             }
             Prim::Fill { pts, color: c, alpha, outline } if pts.len() >= 3 => {
                 let pts: Vec<Pos2> = pts.iter().map(|p| m.map(*p)).collect();
-                let outline = outline.map(|(oc, w)| (oc, w * k));
+                let outline = outline.map(|(oc, w)| (color(oc, 255), w * k));
                 let obj = path_object(doc, &pts, true, outline, Some(color(c, alpha)))?;
                 objects.add_path_object(obj)?;
             }
-            Prim::Text { origin, text, size, color: c } => {
+            Prim::Text { origin, text, size, color: c, alpha } => {
                 let (runs, lost) = font_runs(&text);
                 fonts.missing += lost;
                 let mut x = 0.0;
@@ -403,15 +407,15 @@ fn emit_prims<'a>(
                     let o = m.map(origin) + ux * (x * k);
                     x += crate::annot::text_width(&run, size);
                     let mut obj = PdfPageTextObject::new(doc, &run, f, PdfPoints::new(size * k))?;
-                    obj.set_fill_color(color(c, 255))?;
+                    obj.set_fill_color(color(c, alpha))?;
                     obj.apply_matrix(PdfMatrix::new(ux.x, ux.y, uy.x, uy.y, o.x, o.y))?;
                     objects.add_text_object(obj)?;
                 }
             }
-            Prim::Image { rect, image } => {
+            Prim::Image { rect, image, alpha } => {
                 // Image space is the unit square with the picture's top edge at y = 1.
                 let (bl, br, tl) = (m.map(rect.left_bottom()), m.map(rect.right_bottom()), m.map(rect.left_top()));
-                let img = images.get(&image, rect.size() * k)?;
+                let img = images.get(&image, rect.size() * k, alpha)?;
                 let mut obj = PdfPageImageObject::new(doc, img)?;
                 obj.apply_matrix(PdfMatrix::new(br.x - bl.x, br.y - bl.y, tl.x - bl.x, tl.y - bl.y, bl.x, bl.y))?;
                 objects.add_image_object(obj)?;
@@ -500,7 +504,7 @@ mod tests {
     }
 
     fn annot(page: usize, kind: Kind) -> Annot {
-        Annot { id: 0, page, color: [255, 0, 0], width: 2.0, kind, wrap_w: None, group: None }
+        Annot { id: 0, page, color: [255, 0, 0], width: 2.0, kind, wrap_w: None, group: None, look: Default::default() }
     }
 
     /// Exports onto pages with every /Rotate value and an offset CropBox, then
@@ -623,6 +627,39 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// See-through and filled markups keep their transparency in both export modes.
+    #[test]
+    fn export_keeps_opacity_and_fill() {
+        let _g = PDFIUM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let pdfium = test_pdfium();
+        let dir = std::env::temp_dir().join(format!("greenline-alpha-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, out) = (dir.join("in.pdf"), dir.join("out.pdf"));
+        {
+            let mut doc = pdfium.create_new_pdf().unwrap();
+            doc.pages_mut().create_page_at_end(PdfPagePaperSize::Custom(PdfPoints::new(400.0), PdfPoints::new(300.0))).unwrap();
+            doc.save_to_file(&src).unwrap();
+        }
+        let mut solid = annot(0, Kind::Rect { rect: Rect::from_min_size(pos2(50.0, 50.0), vec2(100.0, 100.0)) });
+        solid.look.fill = Some([0, 0, 255]);
+        let mut faint = annot(0, Kind::Rect { rect: Rect::from_min_size(pos2(250.0, 50.0), vec2(100.0, 100.0)) });
+        faint.look = crate::annot::Look { opacity: 0.5, fill: Some([0, 0, 255]), fill_opacity: 1.0 };
+        let mut thin_line = annot(0, Kind::Line { a: pos2(0.0, 250.0), b: pos2(400.0, 250.0) });
+        thin_line.width = 10.0;
+        thin_line.look.opacity = 0.3;
+        for mode in [ExportMode::Flatten, ExportMode::Editable] {
+            export(pdfium, &src, &out, &[solid.clone(), faint.clone(), thin_line.clone()], &HashMap::new(), mode, "test").unwrap();
+            let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
+            let img = render_region(&doc, 0, 1.0, [0, 0], [400, 300]).unwrap();
+            let px = |x: usize, y: usize| img.pixels[y * 400 + x];
+            let (s, f, l) = (px(100, 100), px(300, 100), px(200, 250));
+            assert!(s.b() > 200 && s.r() < 40, "{mode:?}: solid fill {s:?}");
+            assert!(f.b() > 200 && (100..200).contains(&f.r()), "{mode:?}: half-opacity fill {f:?}");
+            assert!(l.r() > 220 && l.g() > 150, "{mode:?}: faint line {l:?}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Page with an inherited MediaBox and a visible, non-printing annotation:
     /// export must keep the page size and leave the annotation visible.
     #[test]
@@ -687,7 +724,7 @@ mod sample {
         let out = src.with_file_name("sample_markup.pdf");
         let _guard = PDFIUM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let pdfium = test_pdfium();
-        let mk = |page, kind| Annot { id: 0, page, color: [228, 0, 0], width: 2.0, kind, wrap_w: None, group: None };
+        let mk = |page, kind| Annot { id: 0, page, color: [228, 0, 0], width: 2.0, kind, wrap_w: None, group: None, look: Default::default() };
         let annots = vec![
             mk(0, Kind::Callout { anchor: pos2(600.0, 500.0), pos: pos2(800.0, 300.0), box_w: 192.0, text: "Confirm drain locations vs. structural — typ. all roof areas".into(), size: 12.0 }),
             mk(0, Kind::Cloud { rect: egui::Rect::from_min_max(pos2(500.0, 420.0), pos2(700.0, 560.0)) }),

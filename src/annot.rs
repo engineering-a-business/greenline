@@ -24,6 +24,30 @@ pub struct Annot {
     /// Markups sharing a group id on one page select and move together.
     #[serde(default)]
     pub group: Option<u64>,
+    #[serde(flatten)]
+    pub look: Look,
+}
+
+/// Transparency and fill. Stored flat in the markup (older files get the defaults).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Look {
+    /// Whole markup, 0..=1.
+    pub opacity: f32,
+    /// Inside colour for shapes and text boxes that take one (`Kind::fills`).
+    pub fill: Option<Rgb>,
+    /// The fill's own opacity, 0..=1, on top of `opacity`.
+    pub fill_opacity: f32,
+}
+
+impl Default for Look {
+    fn default() -> Self {
+        Self { opacity: 1.0, fill: None, fill_opacity: 1.0 }
+    }
+}
+
+fn a8(x: f32) -> u8 {
+    (x.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -51,21 +75,22 @@ pub enum Kind {
     Perimeter { pts: Vec<Pos2>, closed: bool, scale: f32, size: f32 },
 }
 
+/// `alpha` is 0..=255 throughout.
 #[derive(Clone, Debug)]
 pub enum Prim {
-    Stroke { pts: Vec<Pos2>, closed: bool, width: f32, color: Rgb },
-    /// Closed polygon fill with optional outline. `alpha` 0..=255.
+    Stroke { pts: Vec<Pos2>, closed: bool, width: f32, color: Rgb, alpha: u8 },
+    /// Closed polygon fill (any shape, not only convex) with optional outline.
     Fill { pts: Vec<Pos2>, color: Rgb, alpha: u8, outline: Option<(Rgb, f32)> },
     /// One line of Helvetica text; `origin` is the left end of the baseline.
-    Text { origin: Pos2, text: String, size: f32, color: Rgb },
+    Text { origin: Pos2, text: String, size: f32, color: Rgb, alpha: u8 },
     /// Library image stretched over `rect` (it keeps its aspect when resized).
-    Image { rect: Rect, image: String },
+    Image { rect: Rect, image: String, alpha: u8 },
 }
 
 pub const WHITE: Rgb = [255, 255, 255];
 
 /// Architectural drawing scales as (real inches per paper inch, name), largest first.
-pub const SCALES: [(f32, &str); 8] = [
+pub const SCALES: [(f32, &str); 10] = [
     (12.0, "1\" = 1'-0\""),
     (16.0, "3/4\" = 1'-0\""),
     (24.0, "1/2\" = 1'-0\""),
@@ -74,6 +99,8 @@ pub const SCALES: [(f32, &str); 8] = [
     (64.0, "3/16\" = 1'-0\""),
     (96.0, "1/8\" = 1'-0\""),
     (128.0, "3/32\" = 1'-0\""),
+    (192.0, "1/16\" = 1'-0\""),
+    (384.0, "1/32\" = 1'-0\""),
 ];
 
 pub fn scale_name(scale: f32) -> String {
@@ -468,6 +495,20 @@ impl Annot {
     }
 
     pub fn prims(&self) -> Vec<Prim> {
+        let mut out = self.opaque_prims();
+        if self.look.opacity < 1.0 {
+            fade(&mut out, self.look.opacity);
+        }
+        out
+    }
+
+    /// The chosen fill as a prim over `pts`, if this markup has one.
+    fn fill_prim(&self, pts: Vec<Pos2>) -> Option<Prim> {
+        let f = self.look.fill.filter(|_| self.kind.fills())?;
+        Some(Prim::Fill { pts, color: f, alpha: a8(self.look.fill_opacity), outline: None })
+    }
+
+    fn opaque_prims(&self) -> Vec<Prim> {
         let c = self.color;
         let w = self.width;
         let mut out = Vec::new();
@@ -481,20 +522,30 @@ impl Annot {
                     let knee = start + normal * landing(*size).min(room.max(0.0));
                     arrow_path_prims(&mut out, &[start, knee], *anchor, w, c);
                 }
-                out.push(Prim::Fill { pts: rect_pts(r), color: WHITE, alpha: 255, outline: Some((c, w)) });
+                // White unless a fill is chosen.
+                let (fc, fa) = self.look.fill.map(|f| (f, a8(self.look.fill_opacity))).unwrap_or((WHITE, 255));
+                out.push(Prim::Fill { pts: rect_pts(r), color: fc, alpha: fa, outline: Some((c, w)) });
                 text_prims(&mut out, r, text, *size, c);
             }
             Kind::Text { text, size, .. } => {
                 let r = self.text_box().unwrap();
+                out.extend(self.fill_prim(rect_pts(r)));
                 text_prims(&mut out, r, text, *size, c);
             }
-            Kind::Cloud { rect } => out.push(Prim::Stroke { pts: cloud_pts(*rect), closed: true, width: w, color: c }),
-            Kind::Rect { rect } => out.push(Prim::Stroke { pts: rect_pts(*rect), closed: true, width: w, color: c }),
+            Kind::Cloud { rect } => {
+                let pts = cloud_pts(*rect);
+                out.extend(self.fill_prim(pts.clone()));
+                out.push(Prim::Stroke { pts, closed: true, width: w, color: c, alpha: 255 });
+            }
+            Kind::Rect { rect } => {
+                out.extend(self.fill_prim(rect_pts(*rect)));
+                out.push(Prim::Stroke { pts: rect_pts(*rect), closed: true, width: w, color: c, alpha: 255 });
+            }
             Kind::Highlight { rect } => out.push(Prim::Fill { pts: rect_pts(*rect), color: c, alpha: 90, outline: None }),
             Kind::Arrow { a, b } => arrow_prims(&mut out, *a, *b, w, c),
-            Kind::Line { a, b } => out.push(Prim::Stroke { pts: vec![*a, *b], closed: false, width: w, color: c }),
-            Kind::Pen { pts } => out.push(Prim::Stroke { pts: pts.clone(), closed: false, width: w, color: c }),
-            Kind::Image { rect, image, .. } => out.push(Prim::Image { rect: *rect, image: image.clone() }),
+            Kind::Line { a, b } => out.push(Prim::Stroke { pts: vec![*a, *b], closed: false, width: w, color: c, alpha: 255 }),
+            Kind::Pen { pts } => out.push(Prim::Stroke { pts: pts.clone(), closed: false, width: w, color: c, alpha: 255 }),
+            Kind::Image { rect, image, .. } => out.push(Prim::Image { rect: *rect, image: image.clone(), alpha: 255 }),
             Kind::Distance { a, b, off, size, .. } => {
                 let n = dim_normal(*a, *b);
                 let side = if *off < 0.0 { -1.0 } else { 1.0 };
@@ -503,26 +554,30 @@ impl Annot {
                 let (gap, over) = (2.0, 3.0 + w);
                 if off.abs() > gap {
                     for (from, to) in [(*a, p1), (*b, p2)] {
-                        out.push(Prim::Stroke { pts: vec![from + n * side * gap, to + n * side * over], closed: false, width: w * 0.6, color: c });
+                        out.push(Prim::Stroke { pts: vec![from + n * side * gap, to + n * side * over], closed: false, width: w * 0.6, color: c, alpha: 255 });
                     }
                 }
-                out.push(Prim::Stroke { pts: vec![p1, p2], closed: false, width: w, color: c });
+                out.push(Prim::Stroke { pts: vec![p1, p2], closed: false, width: w, color: c, alpha: 255 });
                 // Architectural ticks at both ends.
                 let dir = if (*b - *a).length() > 1e-4 { (*b - *a).normalized() } else { Vec2::X };
                 let t = (dir + n).normalized() * (3.0 + 1.5 * w);
                 for p in [p1, p2] {
-                    out.push(Prim::Stroke { pts: vec![p - t, p + t], closed: false, width: w * 1.5, color: c });
+                    out.push(Prim::Stroke { pts: vec![p - t, p + t], closed: false, width: w * 1.5, color: c, alpha: 255 });
                 }
                 let text = self.measure_text().unwrap_or_default();
                 label_prims(&mut out, p1 + (p2 - p1) * 0.5, n * side, &text, *size, c);
             }
             Kind::Area { pts, size, .. } => {
-                out.push(Prim::Stroke { pts: pts.clone(), closed: true, width: w, color: c });
+                out.extend(self.fill_prim(pts.clone()));
+                out.push(Prim::Stroke { pts: pts.clone(), closed: true, width: w, color: c, alpha: 255 });
                 let text = self.measure_text().unwrap_or_default();
                 label_prims(&mut out, centroid(pts), Vec2::ZERO, &text, *size, c);
             }
             Kind::Perimeter { pts, closed, size, .. } => {
-                out.push(Prim::Stroke { pts: pts.clone(), closed: *closed, width: w, color: c });
+                if *closed {
+                    out.extend(self.fill_prim(pts.clone()));
+                }
+                out.push(Prim::Stroke { pts: pts.clone(), closed: *closed, width: w, color: c, alpha: 255 });
                 let text = self.measure_text().unwrap_or_default();
                 if *closed && pts.len() > 2 {
                     label_prims(&mut out, centroid(pts), Vec2::ZERO, &text, *size, c);
@@ -536,6 +591,74 @@ impl Annot {
     }
 }
 
+/// Scales every prim's alpha by `opacity`. A fill's outline becomes its own
+/// stroke so it fades too.
+fn fade(prims: &mut Vec<Prim>, opacity: f32) {
+    let k = |a: u8| a8(a as f32 / 255.0 * opacity);
+    let mut out = Vec::with_capacity(prims.len());
+    for p in prims.drain(..) {
+        match p {
+            Prim::Fill { pts, color, alpha, outline } => {
+                let outline = outline.map(|(oc, w)| Prim::Stroke { pts: pts.clone(), closed: true, width: w, color: oc, alpha: k(255) });
+                out.push(Prim::Fill { pts, color, alpha: k(alpha), outline: None });
+                out.extend(outline);
+            }
+            Prim::Stroke { pts, closed, width, color, alpha } => out.push(Prim::Stroke { pts, closed, width, color, alpha: k(alpha) }),
+            Prim::Text { origin, text, size, color, alpha } => out.push(Prim::Text { origin, text, size, color, alpha: k(alpha) }),
+            Prim::Image { rect, image, alpha } => out.push(Prim::Image { rect, image, alpha: k(alpha) }),
+        }
+    }
+    *prims = out;
+}
+
+impl Kind {
+    /// Whether a fill colour applies (callouts always have one: white by default).
+    pub fn fills(&self) -> bool {
+        matches!(self, Kind::Callout { .. } | Kind::Text { .. } | Kind::Cloud { .. } | Kind::Rect { .. } | Kind::Area { .. } | Kind::Perimeter { closed: true, .. })
+    }
+}
+
+/// Triangles (index triples) covering a simple polygon, by ear clipping.
+/// Used to fill shapes on screen that aren't convex (clouds, areas).
+pub fn triangulate(pts: &[Pos2]) -> Vec<[usize; 3]> {
+    let mut idx: Vec<usize> = (0..pts.len()).collect();
+    idx.dedup_by(|a, b| (pts[*a] - pts[*b]).length() < 1e-4);
+    if idx.len() < 3 {
+        return Vec::new();
+    }
+    let area2: f32 = (0..idx.len()).map(|i| {
+        let (p, q) = (pts[idx[i]], pts[idx[(i + 1) % idx.len()]]);
+        p.x * q.y - q.x * p.y
+    }).sum();
+    let ccw = area2 > 0.0;
+    let cross = |a: Pos2, b: Pos2, c: Pos2| (b - a).x * (c - a).y - (b - a).y * (c - a).x;
+    let convex = |a, b, c| if ccw { cross(a, b, c) > 0.0 } else { cross(a, b, c) < 0.0 };
+    let inside = |p: Pos2, a, b, c| {
+        let (d1, d2, d3) = (cross(a, b, p), cross(b, c, p), cross(c, a, p));
+        let neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+        let pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+        !(neg && pos)
+    };
+    let mut out = Vec::with_capacity(idx.len());
+    // Each pass clips one vertex, so this loop runs at most len - 3 times.
+    while idx.len() > 3 {
+        let n = idx.len();
+        let ear = (0..n).find(|&i| {
+            let (ia, ib, ic) = (idx[(i + n - 1) % n], idx[i], idx[(i + 1) % n]);
+            let (a, b, c) = (pts[ia], pts[ib], pts[ic]);
+            convex(a, b, c) && idx.iter().all(|&j| j == ia || j == ib || j == ic || !inside(pts[j], a, b, c))
+        });
+        // Self-touching or degenerate input: clip anyway rather than loop forever.
+        let i = ear.unwrap_or(0);
+        out.push([idx[(i + n - 1) % n], idx[i], idx[(i + 1) % n]]);
+        idx.remove(i);
+    }
+    if idx.len() == 3 {
+        out.push([idx[0], idx[1], idx[2]]);
+    }
+    out
+}
+
 /// A measurement's value on a white plate centred at `at`, pushed along `away`
 /// (a unit vector, or zero to stay centred) until the plate clears `at`.
 fn label_prims(out: &mut Vec<Prim>, at: Pos2, away: Vec2, text: &str, size: f32, color: Rgb) {
@@ -546,7 +669,7 @@ fn label_prims(out: &mut Vec<Prim>, at: Pos2, away: Vec2, text: &str, size: f32,
     let r = Rect::from_center_size(center, half * 2.0);
     out.push(Prim::Fill { pts: rect_pts(r), color: WHITE, alpha: 255, outline: None });
     let origin = pos2(r.min.x + p, r.min.y + p * 0.5 + (line_h(size) - size) / 2.0 + ascent(size));
-    out.push(Prim::Text { origin, text: text.to_string(), size, color });
+    out.push(Prim::Text { origin, text: text.to_string(), size, color, alpha: 255 });
 }
 
 fn text_prims(out: &mut Vec<Prim>, r: Rect, text: &str, size: f32, color: Rgb) {
@@ -556,7 +679,7 @@ fn text_prims(out: &mut Vec<Prim>, r: Rect, text: &str, size: f32, color: Rgb) {
             continue;
         }
         let y = r.min.y + pad(size) + i as f32 * line_h(size) + ascent(size);
-        out.push(Prim::Text { origin: pos2(x, y), text: line, size, color });
+        out.push(Prim::Text { origin: pos2(x, y), text: line, size, color, alpha: 255 });
     }
 }
 
@@ -600,7 +723,7 @@ fn arrow_path_prims(out: &mut Vec<Prim>, path: &[Pos2], tip: Pos2, w: f32, c: Rg
     let mut pts = path.to_vec();
     pts.dedup_by(|a, b| (*a - *b).length() < 0.01);
     pts.push(base + dir * (w * 0.5));
-    out.push(Prim::Stroke { pts, closed: false, width: w, color: c });
+    out.push(Prim::Stroke { pts, closed: false, width: w, color: c, alpha: 255 });
     let hw = hl * 0.38;
     out.push(Prim::Fill { pts: vec![tip, base + n * hw, base - n * hw], color: c, alpha: 255, outline: None });
 }
@@ -774,7 +897,7 @@ mod tests {
 
     #[test]
     fn fit_box_shrinks_and_keeps_callout_edge() {
-        let mut a = Annot { id: 1, page: 0, color: [0, 0, 0], width: 2.0, wrap_w: None, group: None, kind: Kind::Callout { anchor: pos2(500.0, 0.0), pos: pos2(100.0, 0.0), box_w: 300.0, text: "Short".into(), size: 12.0 } };
+        let mut a = Annot { id: 1, page: 0, color: [0, 0, 0], width: 2.0, wrap_w: None, group: None, look: Look::default(), kind: Kind::Callout { anchor: pos2(500.0, 0.0), pos: pos2(100.0, 0.0), box_w: 300.0, text: "Short".into(), size: 12.0 } };
         let right = a.text_box().unwrap().max.x;
         a.fit_box_w();
         let r = a.text_box().unwrap();
@@ -787,7 +910,7 @@ mod tests {
 
     #[test]
     fn marquee_touches_lines_not_empty_space() {
-        let ann = |kind| Annot { id: 1, page: 0, color: [0, 0, 0], width: 2.0, wrap_w: None, group: None, kind };
+        let ann = |kind| Annot { id: 1, page: 0, color: [0, 0, 0], width: 2.0, wrap_w: None, group: None, look: Look::default(), kind };
         let box_at = |x: f32, y: f32| Rect::from_min_size(pos2(x, y), vec2(10.0, 10.0));
         let diag = ann(Kind::Line { a: pos2(0.0, 0.0), b: pos2(100.0, 100.0) });
         assert!(diag.touches(box_at(45.0, 45.0)));
@@ -814,7 +937,7 @@ mod tests {
 
     #[test]
     fn image_hits_inside_and_labels_by_name() {
-        let a = Annot { id: 1, page: 0, color: [0, 0, 0], width: 2.0, wrap_w: None, group: None, kind: Kind::Image { rect: Rect::from_min_size(pos2(10.0, 10.0), vec2(50.0, 50.0)), image: "x.png".into(), name: "NC seal".into() } };
+        let a = Annot { id: 1, page: 0, color: [0, 0, 0], width: 2.0, wrap_w: None, group: None, look: Look::default(), kind: Kind::Image { rect: Rect::from_min_size(pos2(10.0, 10.0), vec2(50.0, 50.0)), image: "x.png".into(), name: "NC seal".into() } };
         assert_eq!(a.distance(pos2(30.0, 30.0)), 0.0);
         assert!((a.distance(pos2(100.0, 30.0)) - 39.0).abs() < 1e-3, "outline distance less half the line width");
         assert!(a.touches(Rect::from_min_size(pos2(20.0, 20.0), vec2(5.0, 5.0))));
@@ -834,7 +957,7 @@ mod tests {
 
     #[test]
     fn measurements_use_their_scale() {
-        let ann = |kind| Annot { id: 1, page: 0, color: [0, 0, 0], width: 1.0, wrap_w: None, group: None, kind };
+        let ann = |kind| Annot { id: 1, page: 0, color: [0, 0, 0], width: 1.0, wrap_w: None, group: None, look: Look::default(), kind };
         // 1/4" = 1'-0": one paper inch (72 pt) is 4 feet.
         let d = ann(Kind::Distance { a: pos2(0.0, 0.0), b: pos2(72.0, 0.0), off: -20.0, scale: 48.0, size: 10.0 });
         assert_eq!(d.measure_text().unwrap(), "4'-0\"");
@@ -850,6 +973,41 @@ mod tests {
         // The dimension line sits at the offset and is what a click hits.
         assert!(d.distance(pos2(36.0, -20.0)) < 0.01);
         assert!(d.bounds().contains(pos2(36.0, -20.0)) && d.bounds().contains(pos2(0.0, 0.0)));
+    }
+
+    #[test]
+    fn fill_and_opacity_reach_the_prims() {
+        let mut a = Annot { id: 1, page: 0, color: [228, 0, 0], width: 2.0, wrap_w: None, group: None, look: Look::default(), kind: Kind::Rect { rect: Rect::from_min_size(pos2(0.0, 0.0), vec2(50.0, 50.0)) } };
+        assert_eq!(a.prims().len(), 1, "no fill by default");
+        a.look = Look { opacity: 0.5, fill: Some([255, 214, 0]), fill_opacity: 0.4 };
+        let p = a.prims();
+        assert!(matches!(p[0], Prim::Fill { color: [255, 214, 0], alpha: 51, .. }), "{p:?}");
+        assert!(matches!(p[1], Prim::Stroke { alpha: 128, .. }));
+        // Lines don't take a fill.
+        a.kind = Kind::Line { a: pos2(0.0, 0.0), b: pos2(9.0, 9.0) };
+        assert_eq!(a.prims().len(), 1);
+        // Callouts: fill replaces the white box, and the outline fades with the rest.
+        a.kind = Kind::Callout { anchor: pos2(0.0, 0.0), pos: pos2(100.0, 0.0), box_w: 100.0, text: "x".into(), size: 12.0 };
+        let p = a.prims();
+        assert!(p.iter().any(|p| matches!(p, Prim::Fill { color: [255, 214, 0], .. })));
+        assert!(p.iter().all(|p| !matches!(p, Prim::Fill { outline: Some(_), .. })));
+        assert!(p.iter().any(|p| matches!(p, Prim::Text { alpha: 128, .. })));
+    }
+
+    #[test]
+    fn triangulates_concave_shapes() {
+        let l = [pos2(0.0, 0.0), pos2(20.0, 0.0), pos2(20.0, 10.0), pos2(10.0, 10.0), pos2(10.0, 20.0), pos2(0.0, 20.0)];
+        let t = triangulate(&l);
+        assert_eq!(t.len(), 4);
+        let area: f32 = t.iter().map(|[a, b, c]| poly_area(&[l[*a], l[*b], l[*c]])).sum();
+        assert!((area - 300.0).abs() < 1e-3, "{area}");
+        let cloud = cloud_pts(Rect::from_min_max(pos2(0.0, 0.0), pos2(100.0, 60.0)));
+        let t = triangulate(&cloud);
+        let area: f32 = t.iter().map(|[a, b, c]| poly_area(&[cloud[*a], cloud[*b], cloud[*c]])).sum();
+        assert_eq!(t.len(), cloud.len() - 2, "every vertex clipped");
+        assert!((area - poly_area(&cloud)).abs() < 1.0, "{area} vs {}", poly_area(&cloud));
+        let outer = Rect::from_min_max(pos2(0.0, 0.0), pos2(100.0, 60.0)).expand(cloud_radius(Rect::from_min_max(pos2(0.0, 0.0), pos2(100.0, 60.0))));
+        assert!(t.iter().all(|[a, b, c]| outer.contains(((cloud[*a].to_vec2() + cloud[*b].to_vec2() + cloud[*c].to_vec2()) / 3.0).to_pos2())));
     }
 
     #[test]

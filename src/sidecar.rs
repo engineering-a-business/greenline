@@ -76,6 +76,9 @@ pub struct Prefs {
     pub theme: egui::ThemePreference,
     /// Drawing scale for new measurements: real inches per paper inch (48 = 1/4" = 1'-0").
     pub scale: f32,
+    pub show_favorites: bool,
+    /// Favorites bar slots 1-9 (missing or None = empty).
+    pub favorites: Vec<Option<crate::app::Favorite>>,
 }
 
 impl Default for Prefs {
@@ -88,6 +91,8 @@ impl Default for Prefs {
             date_format: "%m/%d/%Y".into(),
             theme: egui::ThemePreference::System,
             scale: 48.0,
+            show_favorites: true,
+            favorites: Vec::new(),
         }
     }
 }

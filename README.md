@@ -17,7 +17,9 @@ Fast, native PDF markup for senior review of drawing sets, specs and decks. Buil
 | `A` `L` `P` | Arrow, line, pen |
 | `Shift+D` | Distance: click two points, move to pull the dimension line off them, click to place |
 | `Shift+A` `Shift+P` | Area (SF) / perimeter: click points; click the first point, double-click or `Enter` to finish |
-| Scale | Toolbar picker for measurements: 1", 3/4", 1/2", 3/8", 1/4", 3/16", 1/8", 3/32" = 1'-0" (assumes a full-size PDF) |
+| Scale | Toolbar picker for measurements: 1", 3/4", 1/2", 3/8", 1/4", 3/16", 1/8", 3/32", 1/16", 1/32" = 1'-0" (assumes a full-size PDF) |
+| Opacity, Fill | Toolbar: see-through markups; fill colour and fill opacity for callouts, text boxes, rectangles, clouds and areas |
+| `F` + `1`–`9` | Favorites bar (right): hold F and press a number. Click an empty slot to save the current tool, colour, line, text size, opacity and fill; right-click to replace, rename or clear. Tapping `F` alone still fits the page |
 | `V` / `Esc` | Select: move, resize, double-click or `Enter` to edit text |
 | `1`–`6`, `[` `]`, `{` `}` | Colour (green, red, blue, black, orange, yellow; new markups start red), line width, text size |
 | `S` `O` `M` `G` | Thumbnails, overview, markup list, go to page |
