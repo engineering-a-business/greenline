@@ -15,13 +15,17 @@ Fast, native PDF markup for senior review of drawing sets, specs and decks. Buil
 | `C` | Callout: press on the target, drag to where the note goes (click = quick note) |
 | `T` `K` `R` `H` | Text box, revision cloud, rectangle, highlight |
 | `A` `L` `P` | Arrow, line, pen |
+| `Shift+D` | Distance: click two points, move to pull the dimension line off them, click to place |
+| `Shift+A` `Shift+P` | Area (SF) / perimeter: click points; click the first point, double-click or `Enter` to finish |
+| Scale | Toolbar picker for measurements: 1", 3/4", 1/2", 3/8", 1/4", 3/16", 1/8", 3/32" = 1'-0" (assumes a full-size PDF) |
 | `V` / `Esc` | Select: move, resize, double-click or `Enter` to edit text |
-| `1`–`6`, `[` `]`, `{` `}` | Colour (Copeland medium green by default, then red, blue, black, orange, yellow), line width, text size |
+| `1`–`6`, `[` `]`, `{` `}` | Colour (green, red, blue, black, orange, yellow; new markups start red), line width, text size |
 | `S` `O` `M` `G` | Thumbnails, overview, markup list, go to page |
 | `I` | Stamps: seal and signature images (PNG/JPEG) and the date; place them, then copy the set to the same spot on other sheets |
 | `Ctrl+G` / `Ctrl+Shift+G` | Group / ungroup the selection (Alt+click picks one piece of a group) |
 | Arrows | With a selection: nudge it (`Shift` for bigger steps); otherwise previous/next page and scroll |
 | `Ctrl+E` / `Ctrl+Alt+E` | Export flattened / editable PDF next to the original |
+| `Ctrl+O` / `Ctrl+W` / `Ctrl+Tab` | Open PDFs in tabs / close the tab / next tab; drag a tab off the bar (or right-click it) to move it to a new window |
 | `F1` | All shortcuts, your name for exported comments, and light/dark appearance |
 
 Markups autosave (`%APPDATA%\Greenline` on Windows, `~/.local/share/greenline` on Linux; an old Redline folder is moved there on first launch); the source PDF is never modified. Stamp images are copied into `images/` there, so placed stamps keep working if the original file moves.

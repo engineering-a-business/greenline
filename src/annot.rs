@@ -41,6 +41,14 @@ pub enum Kind {
     /// Stamp or signature from the image library (`stamps`), drawn into `rect`.
     /// `image` is the stored file's name; `name` is what the markup list shows.
     Image { rect: Rect, image: String, name: String },
+    /// Dimension from `a` to `b`. Its line sits `off` points to the side of a→b
+    /// (along `dim_normal`), joined to the points by extension lines.
+    /// `scale` is real inches per paper inch (48 for 1/4" = 1'-0"); `size` is the label's text size.
+    Distance { a: Pos2, b: Pos2, off: f32, scale: f32, size: f32 },
+    /// Measured polygon, labelled with its area.
+    Area { pts: Vec<Pos2>, scale: f32, size: f32 },
+    /// Measured polyline, labelled with its total length; `closed` when it returns to its start.
+    Perimeter { pts: Vec<Pos2>, closed: bool, scale: f32, size: f32 },
 }
 
 #[derive(Clone, Debug)]
@@ -55,6 +63,99 @@ pub enum Prim {
 }
 
 pub const WHITE: Rgb = [255, 255, 255];
+
+/// Architectural drawing scales as (real inches per paper inch, name), largest first.
+pub const SCALES: [(f32, &str); 8] = [
+    (12.0, "1\" = 1'-0\""),
+    (16.0, "3/4\" = 1'-0\""),
+    (24.0, "1/2\" = 1'-0\""),
+    (32.0, "3/8\" = 1'-0\""),
+    (48.0, "1/4\" = 1'-0\""),
+    (64.0, "3/16\" = 1'-0\""),
+    (96.0, "1/8\" = 1'-0\""),
+    (128.0, "3/32\" = 1'-0\""),
+];
+
+pub fn scale_name(scale: f32) -> String {
+    SCALES.iter().find(|(s, _)| (*s - scale).abs() < 1e-3).map(|(_, n)| n.to_string()).unwrap_or_else(|| format!("1:{scale}"))
+}
+
+/// Real-world inches for `pt` page points on a sheet drawn at `scale`
+/// (assumes the PDF is at full sheet size: 72 points to the paper inch).
+pub fn real_inches(pt: f32, scale: f32) -> f32 {
+    pt / 72.0 * scale
+}
+
+/// Feet and inches to the nearest 1/4": `12'-6 1/2"`.
+pub fn fmt_len(inches: f32) -> String {
+    let q = (inches.abs() * 4.0).round() as i64;
+    let (ft, rem) = (q / 48, q % 48);
+    let (whole, frac) = (rem / 4, rem % 4);
+    let frac = ["", " 1/4", " 1/2", " 3/4"][frac as usize];
+    format!("{ft}'-{whole}{frac}\"")
+}
+
+/// Square feet, one decimal, thousands separated: `1,234.5 SF`.
+pub fn fmt_area(sq_in: f32) -> String {
+    let tenths = (sq_in.abs() as f64 / 144.0 * 10.0).round() as i64;
+    let (whole, dec) = (tenths / 10, tenths % 10);
+    let digits = whole.to_string();
+    let mut grouped = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(c);
+    }
+    format!("{grouped}.{dec} SF")
+}
+
+/// Unit normal of a→b that a dimension's `off` is measured along.
+pub fn dim_normal(a: Pos2, b: Pos2) -> Vec2 {
+    let d = b - a;
+    if d.length() < 1e-4 {
+        return Vec2::Y;
+    }
+    let d = d.normalized();
+    vec2(-d.y, d.x)
+}
+
+pub fn poly_len(pts: &[Pos2], closed: bool) -> f32 {
+    let open: f32 = pts.windows(2).map(|w| (w[1] - w[0]).length()).sum();
+    match (closed, pts.first(), pts.last()) {
+        (true, Some(f), Some(l)) if pts.len() > 2 => open + (*f - *l).length(),
+        _ => open,
+    }
+}
+
+/// Shoelace area (always positive).
+pub fn poly_area(pts: &[Pos2]) -> f32 {
+    if pts.len() < 3 {
+        return 0.0;
+    }
+    let mut s = 0.0;
+    for i in 0..pts.len() {
+        let (p, q) = (pts[i], pts[(i + 1) % pts.len()]);
+        s += p.x * q.y - q.x * p.y;
+    }
+    (s / 2.0).abs()
+}
+
+/// Area centroid, or the vertex average for a degenerate polygon.
+fn centroid(pts: &[Pos2]) -> Pos2 {
+    let avg = || pts.iter().fold(Vec2::ZERO, |s, p| s + p.to_vec2()) / pts.len().max(1) as f32;
+    let (mut a, mut c) = (0.0, Vec2::ZERO);
+    for i in 0..pts.len() {
+        let (p, q) = (pts[i], pts[(i + 1) % pts.len()]);
+        let cross = p.x * q.y - q.x * p.y;
+        a += cross;
+        c += (p.to_vec2() + q.to_vec2()) * cross;
+    }
+    if a.abs() < 1e-3 {
+        return avg().to_pos2();
+    }
+    (c / (3.0 * a)).to_pos2()
+}
 
 // ---------------------------------------------------------------------------
 // Text layout (Helvetica metrics; Liberation Sans on screen is metric-compatible)
@@ -188,11 +289,43 @@ impl Annot {
     }
 
     /// What lists and exported comments call it: the note, the image name, or the kind.
-    pub fn label(&self) -> &str {
+    pub fn label(&self) -> String {
+        if let Some(m) = self.measure_text() {
+            return format!("{} {m}", self.kind_name());
+        }
         match &self.kind {
-            Kind::Image { name, .. } if !name.trim().is_empty() => name,
-            _ if !self.text().trim().is_empty() => self.text(),
-            _ => self.kind_name(),
+            Kind::Image { name, .. } if !name.trim().is_empty() => name.clone(),
+            _ if !self.text().trim().is_empty() => self.text().to_string(),
+            _ => self.kind_name().to_string(),
+        }
+    }
+
+    /// A measurement's value as shown on the sheet (None for other markups).
+    pub fn measure_text(&self) -> Option<String> {
+        Some(match &self.kind {
+            Kind::Distance { a, b, scale, .. } => fmt_len(real_inches((*b - *a).length(), *scale)),
+            Kind::Perimeter { pts, closed, scale, .. } => fmt_len(real_inches(poly_len(pts, *closed), *scale)),
+            Kind::Area { pts, scale, .. } => {
+                let k = real_inches(1.0, *scale);
+                fmt_area(poly_area(pts) * k * k)
+            }
+            _ => return None,
+        })
+    }
+
+    /// A measurement's drawing scale.
+    pub fn scale(&self) -> Option<f32> {
+        match &self.kind {
+            Kind::Distance { scale, .. } | Kind::Area { scale, .. } | Kind::Perimeter { scale, .. } => Some(*scale),
+            _ => None,
+        }
+    }
+
+    /// Text size of a note or a measurement's label.
+    pub fn label_size_mut(&mut self) -> Option<&mut f32> {
+        match &mut self.kind {
+            Kind::Callout { size, .. } | Kind::Text { size, .. } | Kind::Distance { size, .. } | Kind::Area { size, .. } | Kind::Perimeter { size, .. } => Some(size),
+            _ => None,
         }
     }
 
@@ -215,6 +348,9 @@ impl Annot {
             Kind::Line { .. } => "Line",
             Kind::Pen { .. } => "Pen",
             Kind::Image { .. } => "Stamp",
+            Kind::Distance { .. } => "Distance",
+            Kind::Area { .. } => "Area",
+            Kind::Perimeter { .. } => "Perimeter",
         }
     }
 
@@ -249,6 +385,19 @@ impl Annot {
                 }
                 r.expand(w)
             }
+            Kind::Distance { .. } | Kind::Area { .. } | Kind::Perimeter { .. } => {
+                // The measured points too: a dimension's extension lines stop short of them.
+                let mut r = match &self.kind {
+                    Kind::Distance { a, b, .. } => Rect::from_two_pos(*a, *b),
+                    _ => Rect::NOTHING,
+                };
+                for prim in self.prims() {
+                    if let Prim::Stroke { pts, .. } | Prim::Fill { pts, .. } = prim {
+                        pts.iter().for_each(|p| r.extend_with(*p));
+                    }
+                }
+                r.expand(w)
+            }
         }
     }
 
@@ -260,7 +409,11 @@ impl Annot {
                 *a += d;
                 *b += d;
             }
-            Kind::Pen { pts } => pts.iter_mut().for_each(|p| *p += d),
+            Kind::Pen { pts } | Kind::Area { pts, .. } | Kind::Perimeter { pts, .. } => pts.iter_mut().for_each(|p| *p += d),
+            Kind::Distance { a, b, .. } => {
+                *a += d;
+                *b += d;
+            }
         }
     }
 
@@ -342,9 +495,58 @@ impl Annot {
             Kind::Line { a, b } => out.push(Prim::Stroke { pts: vec![*a, *b], closed: false, width: w, color: c }),
             Kind::Pen { pts } => out.push(Prim::Stroke { pts: pts.clone(), closed: false, width: w, color: c }),
             Kind::Image { rect, image, .. } => out.push(Prim::Image { rect: *rect, image: image.clone() }),
+            Kind::Distance { a, b, off, size, .. } => {
+                let n = dim_normal(*a, *b);
+                let side = if *off < 0.0 { -1.0 } else { 1.0 };
+                let (p1, p2) = (*a + n * *off, *b + n * *off);
+                // Extension lines: a small gap off the measured points, running a little past the dimension line.
+                let (gap, over) = (2.0, 3.0 + w);
+                if off.abs() > gap {
+                    for (from, to) in [(*a, p1), (*b, p2)] {
+                        out.push(Prim::Stroke { pts: vec![from + n * side * gap, to + n * side * over], closed: false, width: w * 0.6, color: c });
+                    }
+                }
+                out.push(Prim::Stroke { pts: vec![p1, p2], closed: false, width: w, color: c });
+                // Architectural ticks at both ends.
+                let dir = if (*b - *a).length() > 1e-4 { (*b - *a).normalized() } else { Vec2::X };
+                let t = (dir + n).normalized() * (3.0 + 1.5 * w);
+                for p in [p1, p2] {
+                    out.push(Prim::Stroke { pts: vec![p - t, p + t], closed: false, width: w * 1.5, color: c });
+                }
+                let text = self.measure_text().unwrap_or_default();
+                label_prims(&mut out, p1 + (p2 - p1) * 0.5, n * side, &text, *size, c);
+            }
+            Kind::Area { pts, size, .. } => {
+                out.push(Prim::Stroke { pts: pts.clone(), closed: true, width: w, color: c });
+                let text = self.measure_text().unwrap_or_default();
+                label_prims(&mut out, centroid(pts), Vec2::ZERO, &text, *size, c);
+            }
+            Kind::Perimeter { pts, closed, size, .. } => {
+                out.push(Prim::Stroke { pts: pts.clone(), closed: *closed, width: w, color: c });
+                let text = self.measure_text().unwrap_or_default();
+                if *closed && pts.len() > 2 {
+                    label_prims(&mut out, centroid(pts), Vec2::ZERO, &text, *size, c);
+                } else if let Some(seg) = pts.windows(2).max_by(|x, y| (x[1] - x[0]).length().total_cmp(&(y[1] - y[0]).length())) {
+                    // Beside the longest run, like a dimension.
+                    label_prims(&mut out, seg[0] + (seg[1] - seg[0]) * 0.5, dim_normal(seg[0], seg[1]), &text, *size, c);
+                }
+            }
         }
         out
     }
+}
+
+/// A measurement's value on a white plate centred at `at`, pushed along `away`
+/// (a unit vector, or zero to stay centred) until the plate clears `at`.
+fn label_prims(out: &mut Vec<Prim>, at: Pos2, away: Vec2, text: &str, size: f32, color: Rgb) {
+    let p = 0.25 * size;
+    let half = vec2(text_width(text, size) / 2.0 + p, line_h(size) / 2.0 + p * 0.5);
+    let reach = away.x.abs() * half.x + away.y.abs() * half.y;
+    let center = at + away * (reach + 1.0);
+    let r = Rect::from_center_size(center, half * 2.0);
+    out.push(Prim::Fill { pts: rect_pts(r), color: WHITE, alpha: 255, outline: None });
+    let origin = pos2(r.min.x + p, r.min.y + p * 0.5 + (line_h(size) - size) / 2.0 + ascent(size));
+    out.push(Prim::Text { origin, text: text.to_string(), size, color });
 }
 
 fn text_prims(out: &mut Vec<Prim>, r: Rect, text: &str, size: f32, color: Rgb) {
@@ -618,6 +820,36 @@ mod tests {
         assert!(a.touches(Rect::from_min_size(pos2(20.0, 20.0), vec2(5.0, 5.0))));
         assert_eq!(a.bounds(), Rect::from_min_size(pos2(10.0, 10.0), vec2(50.0, 50.0)));
         assert_eq!(a.label(), "NC seal");
+    }
+
+    #[test]
+    fn lengths_in_feet_and_inches() {
+        assert_eq!(fmt_len(0.0), "0'-0\"");
+        assert_eq!(fmt_len(150.5), "12'-6 1/2\"");
+        assert_eq!(fmt_len(11.9), "1'-0\"", "rounds up into the next foot");
+        assert_eq!(fmt_len(3.26), "0'-3 1/4\"");
+        assert_eq!(fmt_area(144.0 * 1234.54), "1,234.5 SF");
+        assert_eq!(fmt_area(144.0 * 12.0), "12.0 SF");
+    }
+
+    #[test]
+    fn measurements_use_their_scale() {
+        let ann = |kind| Annot { id: 1, page: 0, color: [0, 0, 0], width: 1.0, wrap_w: None, group: None, kind };
+        // 1/4" = 1'-0": one paper inch (72 pt) is 4 feet.
+        let d = ann(Kind::Distance { a: pos2(0.0, 0.0), b: pos2(72.0, 0.0), off: -20.0, scale: 48.0, size: 10.0 });
+        assert_eq!(d.measure_text().unwrap(), "4'-0\"");
+        assert_eq!(d.label(), "Distance 4'-0\"");
+        // 1/8": a 1 x 2 inch rectangle is 8' x 16' = 128 SF.
+        let sq = vec![pos2(0.0, 0.0), pos2(72.0, 0.0), pos2(72.0, 144.0), pos2(0.0, 144.0)];
+        let a = ann(Kind::Area { pts: sq.clone(), scale: 96.0, size: 10.0 });
+        assert_eq!(a.measure_text().unwrap(), "128.0 SF");
+        let p = ann(Kind::Perimeter { pts: sq.clone(), closed: true, scale: 96.0, size: 10.0 });
+        assert_eq!(p.measure_text().unwrap(), "48'-0\"");
+        let open = ann(Kind::Perimeter { pts: sq, closed: false, scale: 96.0, size: 10.0 });
+        assert_eq!(open.measure_text().unwrap(), "32'-0\"");
+        // The dimension line sits at the offset and is what a click hits.
+        assert!(d.distance(pos2(36.0, -20.0)) < 0.01);
+        assert!(d.bounds().contains(pos2(36.0, -20.0)) && d.bounds().contains(pos2(0.0, 0.0)));
     }
 
     #[test]

@@ -74,6 +74,8 @@ pub struct Prefs {
     pub date_format: String,
     /// Light, dark, or follow the system.
     pub theme: egui::ThemePreference,
+    /// Drawing scale for new measurements: real inches per paper inch (48 = 1/4" = 1'-0").
+    pub scale: f32,
 }
 
 impl Default for Prefs {
@@ -85,6 +87,7 @@ impl Default for Prefs {
             author: String::new(),
             date_format: "%m/%d/%Y".into(),
             theme: egui::ThemePreference::System,
+            scale: 48.0,
         }
     }
 }

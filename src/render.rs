@@ -17,15 +17,20 @@ pub enum Layer {
     Thumb,
 }
 
-/// Pages the viewer still wants; queued renders for other pages are dropped.
+/// Pages the viewer still wants; queued renders for other pages, or for
+/// documents in tabs that aren't showing, are dropped.
 #[derive(Default)]
 pub struct Keep {
+    /// The document (by generation) on screen.
+    pub generation: u64,
     pub base: HashSet<usize>,
     pub thumbs: HashSet<usize>,
 }
 
 pub enum Req {
     Open { generation: u64, path: PathBuf },
+    /// Drop a document whose tab was closed.
+    Close { generation: u64 },
     /// Render the region `origin..origin+size` (pixels) of the page drawn at `scale` px/pt.
     Render { generation: u64, page: usize, scale: f32, origin: [i32; 2], size: [usize; 2], layer: Layer },
     Export { src: PathBuf, out: PathBuf, annots: Vec<Annot>, mode: ExportMode, author: String },
@@ -103,7 +108,8 @@ fn run(
     keep: Arc<Mutex<Keep>>,
     ctx: egui::Context,
 ) {
-    let mut doc: Option<(u64, PdfDocument)> = None;
+    // One per open tab, by generation.
+    let mut docs: HashMap<u64, PdfDocument> = HashMap::new();
     let mut queue: VecDeque<Req> = VecDeque::new();
     loop {
         if queue.is_empty() {
@@ -117,22 +123,22 @@ fn run(
         }
         let Some(req) = next_request(&mut queue, &keep) else { continue };
         let resp = match req {
+            Req::Close { generation } => {
+                docs.remove(&generation);
+                continue;
+            }
             Req::Open { generation, path } => {
-                doc = None;
                 match pdfium.load_pdf_from_file(&path, None) {
                     Ok(d) => {
                         let pages = d.pages().iter().map(|p| vec2(p.width().value, p.height().value)).collect();
-                        doc = Some((generation, d));
+                        docs.insert(generation, d);
                         Resp::Opened { generation, pages }
                     }
                     Err(e) => Resp::OpenFailed { generation, error: format!("{e:?}") },
                 }
             }
             Req::Render { generation, page, scale, origin, size, layer } => {
-                let Some((g, d)) = &doc else { continue };
-                if *g != generation {
-                    continue;
-                }
+                let Some(d) = docs.get(&generation) else { continue };
                 match render_region(d, page, scale, origin, size) {
                     Ok(image) => Resp::Rendered { generation, page, scale, origin, layer, image },
                     Err(e) => Resp::RenderFailed { generation, page, layer, error: e.to_string() },
@@ -162,8 +168,8 @@ fn next_request(queue: &mut VecDeque<Req>, keep: &Mutex<Keep>) -> Option<Req> {
     let mut seen = HashSet::new();
     let mut kept = VecDeque::new();
     while let Some(r) = queue.pop_back() {
-        if let Req::Render { page, layer, .. } = &r {
-            if !seen.insert((*page, *layer)) {
+        if let Req::Render { generation, page, layer, .. } = &r {
+            if !seen.insert((*generation, *page, *layer)) {
                 continue;
             }
         }
@@ -175,6 +181,7 @@ fn next_request(queue: &mut VecDeque<Req>, keep: &Mutex<Keep>) -> Option<Req> {
     }
     let keep = keep.lock().unwrap();
     queue.retain(|r| match r {
+        Req::Render { generation, .. } if *generation != keep.generation => false,
         Req::Render { page, layer: Layer::Base, .. } => keep.base.contains(page),
         Req::Render { page, layer: Layer::Thumb, .. } => keep.thumbs.contains(page),
         _ => true,

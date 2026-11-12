@@ -47,7 +47,19 @@ pub enum Tool {
     Arrow,
     Line,
     Pen,
+    Distance,
+    Area,
+    Perimeter,
 }
+
+impl Tool {
+    fn measures(self) -> bool {
+        matches!(self, Tool::Distance | Tool::Area | Tool::Perimeter)
+    }
+}
+
+/// Measurement tools take Shift + their key, so A/L/P stay arrow/line/pen.
+const MEASURE_TOOLS: [(Tool, &str, Key); 3] = [(Tool::Distance, "Distance", Key::D), (Tool::Area, "Area", Key::A), (Tool::Perimeter, "Perimeter", Key::P)];
 
 const TOOLS: [(Tool, &str, Key); 9] = [
     (Tool::Select, "Select", Key::V),
@@ -61,7 +73,7 @@ const TOOLS: [(Tool, &str, Key); 9] = [
     (Tool::Pen, "Pen", Key::P),
 ];
 
-/// The first is the default for new markups: Copeland medium green.
+/// Keys 1-6 in this order. New markups start red (`DEFAULT_COLOR`).
 const COLORS: [(Rgb, &str); 6] = [
     ([0x6B, 0x9A, 0x1E], "Green"),
     ([228, 0, 0], "Red"),
@@ -70,6 +82,8 @@ const COLORS: [(Rgb, &str); 6] = [
     ([240, 120, 0], "Orange"),
     ([255, 214, 0], "Yellow"),
 ];
+/// Index into `COLORS` every tool starts on: red.
+const DEFAULT_COLOR: usize = 1;
 const COLOR_KEYS: [Key; 6] = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6];
 const TEXT_SIZES: [f32; 6] = [8.0, 10.0, 12.0, 14.0, 18.0, 24.0];
 /// Colour of placed dates.
@@ -90,6 +104,10 @@ enum Handle {
     Anchor,
     A,
     B,
+    /// A dimension line's distance from what it measures.
+    Offset,
+    /// A point of an area or perimeter.
+    Vertex(usize),
 }
 
 enum Drag {
@@ -104,6 +122,8 @@ enum Drag {
     Marquee { page: usize, start: Pos2, cur: Pos2 },
     /// Sizing a stamp being placed (see `App::placing`).
     Place { page: usize, start: Pos2, cur: Pos2 },
+    /// A press with a measuring tool: it puts down a point where it's released.
+    MeasurePoint { page: usize, cur: Pos2 },
     /// Swallow the rest of a gesture (e.g. the click that committed a text edit).
     Ignore,
 }
@@ -125,8 +145,91 @@ struct Mods {
     single: bool,
 }
 
+/// Declares the per-document part of `App`: the `Doc` a background tab keeps
+/// it in, and `App::swap_doc`, which trades it with the fields on screen.
+macro_rules! doc_state {
+    ($($field:ident: $ty:ty = $default:expr,)*) => {
+        /// A document in a tab that isn't showing (the showing one lives in `App`'s own fields).
+        struct Doc {
+            $($field: $ty,)*
+        }
+
+        impl Doc {
+            fn new() -> Self {
+                Self { $($field: $default,)* }
+            }
+        }
+
+        impl App {
+            fn swap_doc(&mut self, d: &mut Doc) {
+                $(std::mem::swap(&mut self.$field, &mut d.$field);)*
+            }
+        }
+    };
+}
+
+doc_state! {
+    path: Option<PathBuf> = None,
+    generation: u64 = 0,
+    pages: Vec<Vec2> = Vec::new(),
+    page_y: Vec<f32> = Vec::new(),
+    doc_w: f32 = 0.0,
+    doc_h: f32 = 0.0,
+    zoom: f32 = 1.0,
+    offset: Vec2 = Vec2::ZERO,
+    fit_pending: bool = false,
+    base: HashMap<usize, PageTex> = HashMap::new(),
+    patch: HashMap<usize, PageTex> = HashMap::new(),
+    req_base: HashMap<usize, f32> = HashMap::new(),
+    req_patch: HashMap<usize, (f32, [i32; 2], [usize; 2])> = HashMap::new(),
+    thumbs: HashMap<usize, PageTex> = HashMap::new(),
+    req_thumb: HashSet<usize> = HashSet::new(),
+    overview: bool = false,
+    overview_cursor: usize = 0,
+    annots: Vec<Annot> = Vec::new(),
+    next_id: u64 = 1,
+    undo: Vec<Vec<Annot>> = Vec::new(),
+    redo: Vec<Vec<Annot>> = Vec::new(),
+    dirty: bool = false,
+    selected: Vec<u64> = Vec::new(),
+    drag: Drag = Drag::None,
+    editing: Option<u64> = None,
+    lock: Option<std::fs::File> = None,
+    read_only: bool = false,
+    read_only_why: String = String::new(),
+    failed: HashSet<usize> = HashSet::new(),
+    last_nudge: (f64, Vec<u64>) = (f64::NEG_INFINITY, Vec::new()),
+    measuring: Option<(usize, Vec<Pos2>)> = None,
+}
+
+/// Page `i`'s top in the document column, and the column's width and height.
+fn layout_pages(pages: &[Vec2]) -> (Vec<f32>, f32, f32) {
+    let mut page_y = Vec::with_capacity(pages.len());
+    let (mut y, mut w) = (GAP, 0.0f32);
+    for s in pages {
+        page_y.push(y);
+        y += s.y + GAP;
+        w = w.max(s.x);
+    }
+    (page_y, w, y)
+}
+
 pub struct App {
     worker: Option<Worker>,
+    /// Open documents in tab order. `tabs[active]` is an empty placeholder:
+    /// the showing document's state is in the fields below (see `doc_state!`).
+    tabs: Vec<Doc>,
+    active: usize,
+    /// Last generation handed out; every opened document gets its own.
+    last_generation: u64,
+    /// Tab being dragged (to reorder, or off the bar into a new window).
+    tab_drag: Option<usize>,
+    /// Window title last sent.
+    title: String,
+    /// Points of an area, perimeter or dimension being measured, on the page given.
+    measuring: Option<(usize, Vec<Pos2>)>,
+    /// Shift held: measuring snaps to horizontal / vertical.
+    ortho: bool,
     status: String,
     status_until: f64,
 
@@ -219,7 +322,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext, path: Option<PathBuf>) -> Self {
+    pub fn new(cc: &eframe::CreationContext, paths: Vec<PathBuf>) -> Self {
         install_fonts(&cc.egui_ctx);
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         let prefs = sidecar::load_prefs();
@@ -230,7 +333,7 @@ impl App {
         };
         let mut app = Self::with(worker, status, prefs);
         app.library = stamps::Library::load();
-        if let Some(p) = path {
+        for p in paths {
             app.open(p);
         }
         app
@@ -239,6 +342,13 @@ impl App {
     fn with(worker: Option<Worker>, status: String, prefs: sidecar::Prefs) -> Self {
         Self {
             worker,
+            tabs: vec![Doc::new()],
+            active: 0,
+            last_generation: 0,
+            tab_drag: None,
+            title: String::new(),
+            measuring: None,
+            ortho: false,
             status,
             status_until: f64::INFINITY,
             path: None,
@@ -279,7 +389,7 @@ impl App {
             redo: Vec::new(),
             dirty: false,
             tool: Tool::Callout,
-            tool_color: HashMap::from([(Tool::Highlight, 5)]),
+            tool_color: HashMap::new(),
             width: 2.0,
             text_size: 12.0,
             selected: Vec::new(),
@@ -317,14 +427,19 @@ impl App {
             return;
         }
         let path = dunce::canonicalize(&path).unwrap_or(path);
-        self.commit_edit();
-        self.save_sidecar();
-        if self.dirty && !self.read_only {
-            self.toast("Autosave failed; not switching documents so markups aren't lost".into());
+        // Already open: show its tab.
+        if let Some(i) = (0..self.tabs.len()).find(|&i| self.tab_path(i) == Some(&path)) {
+            self.switch_tab(i);
             return;
         }
+        // Into a new tab, unless this one is empty.
+        if self.path.is_some() {
+            self.tabs.push(Doc::new());
+            self.switch_tab(self.tabs.len() - 1);
+        }
         let w = self.worker.as_ref().unwrap();
-        self.generation += 1;
+        self.last_generation += 1;
+        self.generation = self.last_generation;
         w.send(Req::Open { generation: self.generation, path: path.clone() });
         self.pages.clear();
         self.base.clear();
@@ -343,6 +458,7 @@ impl App {
         self.editing = None;
         self.drag = Drag::None;
         self.placing = None;
+        self.measuring = None;
         self.annots = Vec::new();
         self.next_id = 1;
         self.lock = None;
@@ -368,20 +484,11 @@ impl App {
         self.status = "Opening…".into();
     }
 
-    fn on_opened(&mut self, ctx: &egui::Context, pages: Vec<Vec2>) {
+    fn on_opened(&mut self, pages: Vec<Vec2>) {
+        (self.page_y, self.doc_w, self.doc_h) = layout_pages(&pages);
         self.pages = pages;
-        self.page_y.clear();
-        let mut y = GAP;
-        self.doc_w = 0.0;
-        for s in &self.pages {
-            self.page_y.push(y);
-            y += s.y + GAP;
-            self.doc_w = self.doc_w.max(s.x);
-        }
-        self.doc_h = y;
         self.fit_pending = true;
         let name = self.file_name();
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{name} — Greenline")));
         let n = self.annots.len();
         if self.read_only {
             self.toast(format!("{name}: {} pages", self.pages.len()));
@@ -392,6 +499,236 @@ impl App {
 
     fn file_name(&self) -> String {
         self.path.as_ref().and_then(|p| p.file_name()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+    }
+
+    // -----------------------------------------------------------------------
+    // Tabs
+
+    fn tab_path(&self, i: usize) -> Option<&PathBuf> {
+        if i == self.active { self.path.as_ref() } else { self.tabs.get(i)?.path.as_ref() }
+    }
+
+    /// Finishes whatever is in progress on the showing document before it goes to the background.
+    fn settle(&mut self) {
+        self.commit_edit();
+        if matches!(self.drag, Drag::Move { .. } | Drag::Handle { .. }) {
+            self.end_drag();
+        }
+        self.drag = Drag::None;
+        self.placing = None;
+        self.save_sidecar();
+        // Renders asked for and not yet back are dropped by the worker once the tab is hidden.
+        self.req_base.clear();
+        self.req_patch.clear();
+        self.req_thumb.clear();
+        self.patch.clear();
+    }
+
+    fn switch_tab(&mut self, i: usize) {
+        if i == self.active || i >= self.tabs.len() {
+            return;
+        }
+        self.settle();
+        let mut shown = std::mem::replace(&mut self.tabs[self.active], Doc::new());
+        self.swap_doc(&mut shown);
+        self.tabs[self.active] = shown;
+        let mut next = std::mem::replace(&mut self.tabs[i], Doc::new());
+        self.swap_doc(&mut next);
+        self.active = i;
+        self.thumbs_wanted.clear();
+        self.sidebar_synced = None;
+        self.hover = None;
+        self.goto = None;
+        self.renaming = None;
+    }
+
+    /// Closes tab `i` after saving its markups; false (and nothing closed) if they couldn't be saved.
+    fn close_tab(&mut self, i: usize) -> bool {
+        if i >= self.tabs.len() {
+            return false;
+        }
+        let gone = if i == self.active {
+            self.settle();
+            if self.dirty && !self.read_only {
+                self.toast("Autosave failed; not closing the tab so markups aren't lost".into());
+                return false;
+            }
+            let mut gone = Doc::new();
+            self.swap_doc(&mut gone);
+            self.tabs.remove(i);
+            if self.tabs.is_empty() {
+                self.tabs.push(Doc::new());
+                self.active = 0;
+                self.status = "Ctrl+O to open a PDF (or drop one here)".into();
+                self.status_until = f64::INFINITY;
+            } else {
+                self.active = i.min(self.tabs.len() - 1);
+                let mut next = std::mem::replace(&mut self.tabs[self.active], Doc::new());
+                self.swap_doc(&mut next);
+            }
+            self.thumbs_wanted.clear();
+            self.sidebar_synced = None;
+            self.goto = None;
+            gone
+        } else {
+            let d = &mut self.tabs[i];
+            if let (true, false, Some(p)) = (d.dirty, d.read_only, &d.path) {
+                if let Err(e) = sidecar::save(p, &d.annots) {
+                    self.toast(format!("Autosave failed ({e}); not closing the tab so markups aren't lost"));
+                    return false;
+                }
+            }
+            if i < self.active {
+                self.active -= 1;
+            }
+            self.tabs.remove(i)
+        };
+        if let Some(w) = &self.worker {
+            w.send(Req::Close { generation: gone.generation });
+        }
+        true
+    }
+
+    fn move_tab(&mut self, from: usize, to: usize) {
+        if from == to || from >= self.tabs.len() || to >= self.tabs.len() {
+            return;
+        }
+        let t = self.tabs.remove(from);
+        self.tabs.insert(to, t);
+        self.active = match self.active {
+            a if a == from => to,
+            a if from < a && to >= a => a - 1,
+            a if from > a && to <= a => a + 1,
+            a => a,
+        };
+    }
+
+    /// Moves tab `i` to a new Greenline window: closes it here (saving its
+    /// markups and releasing their lock), then starts another copy on the file.
+    fn detach_tab(&mut self, i: usize) {
+        if self.tabs.len() < 2 {
+            self.toast("This is the only tab".into());
+            return;
+        }
+        let Some(path) = self.tab_path(i).cloned() else { return };
+        if !self.close_tab(i) {
+            return;
+        }
+        let name = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+        match std::env::current_exe().and_then(|exe| std::process::Command::new(exe).arg(&path).spawn()) {
+            Ok(mut child) => {
+                // Reap it when it exits.
+                std::thread::spawn(move || child.wait());
+                self.toast(format!("Moved {name} to a new window"));
+            }
+            Err(e) => {
+                self.open(path);
+                self.toast(format!("Could not open a new window ({e}); kept {name} here"));
+            }
+        }
+    }
+
+    fn tab_bar(&mut self, ui: &mut Ui) {
+        let mut tabs: Vec<(Rect, egui::Response)> = Vec::new();
+        let mut close = None;
+        let mut detach = None;
+        let mut select = None;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for i in 0..self.tabs.len() {
+                let name = self.tab_path(i).and_then(|p| p.file_name()).map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| "Opening…".into());
+                let active = i == self.active;
+                let font = FontId::proportional(13.0);
+                let colour = if active { ui.visuals().strong_text_color() } else { ui.visuals().text_color() };
+                let galley = ui.painter().layout_no_wrap(name.clone(), font, colour);
+                let w = (galley.size().x + 40.0).clamp(80.0, 260.0);
+                let (rect, resp) = ui.allocate_exact_size(vec2(w, 26.0), Sense::click_and_drag());
+                let bg = if active {
+                    ui.visuals().panel_fill
+                } else if resp.hovered() {
+                    ui.visuals().widgets.hovered.weak_bg_fill
+                } else {
+                    ui.visuals().faint_bg_color
+                };
+                ui.painter().rect_filled(rect, egui::CornerRadius { nw: 4, ne: 4, sw: 0, se: 0 }, bg);
+                if active {
+                    let top = Rect::from_min_size(rect.min, vec2(rect.width(), 2.5));
+                    ui.painter().rect_filled(top, 1.0, crate::theme::accent(ui.visuals()));
+                }
+                let text_clip = Rect::from_min_max(rect.min, pos2(rect.max.x - 22.0, rect.max.y));
+                ui.painter().with_clip_rect(text_clip).galley(pos2(rect.min.x + 10.0, rect.center().y - galley.size().y / 2.0), galley, colour);
+                let x_rect = Rect::from_center_size(pos2(rect.max.x - 12.0, rect.center().y), vec2(16.0, 16.0));
+                let x = ui.interact(x_rect, egui::Id::new(("greenline-tab-close", i)), Sense::click());
+                if x.hovered() {
+                    ui.painter().rect_filled(x_rect, 3.0, ui.visuals().widgets.hovered.bg_fill);
+                }
+                ui.painter().text(x_rect.center(), Align2::CENTER_CENTER, "×", FontId::proportional(14.0), ui.visuals().text_color());
+                if x.on_hover_text("Close tab (Ctrl+W)").clicked() {
+                    close = Some(i);
+                }
+                let resp = resp.on_hover_text(self.tab_path(i).map(|p| p.display().to_string()).unwrap_or_default());
+                if resp.clicked() {
+                    select = Some(i);
+                }
+                if resp.middle_clicked() {
+                    close = Some(i);
+                }
+                if resp.drag_started_by(PointerButton::Primary) {
+                    self.tab_drag = Some(i);
+                    select = Some(i);
+                }
+                resp.context_menu(|ui| {
+                    if ui.add_enabled(self.tabs.len() > 1, egui::Button::new("Move to new window")).clicked() {
+                        detach = Some(i);
+                        ui.close();
+                    }
+                    if ui.button("Close").clicked() {
+                        close = Some(i);
+                        ui.close();
+                    }
+                });
+                tabs.push((rect, resp));
+            }
+            if ui.button("+").on_hover_text("Open PDFs in new tabs (Ctrl+O)").clicked() {
+                self.ask = Some(Pick::Open);
+            }
+        });
+        // Dragging: across the bar reorders; dropped well off it opens the tab in a new window.
+        if let Some(from) = self.tab_drag {
+            let bar = ui.min_rect();
+            let pos = ui.ctx().input(|i| i.pointer.latest_pos());
+            let off_bar = pos.is_none_or(|p| !bar.expand2(vec2(40.0, 30.0)).contains(p));
+            if let Some(p) = pos {
+                ui.ctx().set_cursor_icon(if off_bar && self.tabs.len() > 1 { CursorIcon::Copy } else { CursorIcon::Grabbing });
+                let name = self.tab_path(from).and_then(|p| p.file_name()).map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+                let hint = if off_bar && self.tabs.len() > 1 { format!("{name}  →  new window") } else { name };
+                let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("greenline-tab-ghost")));
+                let g = painter.layout_no_wrap(hint, FontId::proportional(13.0), ui.visuals().strong_text_color());
+                let r = Rect::from_min_size(p + vec2(12.0, 8.0), g.size() + vec2(16.0, 10.0));
+                painter.rect(r, 4.0, ui.visuals().window_fill, ui.visuals().window_stroke, egui::StrokeKind::Inside);
+                painter.galley(r.min + vec2(8.0, 5.0), g, ui.visuals().strong_text_color());
+            }
+            let released = tabs.get(from).is_none_or(|(_, r)| r.drag_stopped()) || !ui.ctx().input(|i| i.pointer.primary_down());
+            if released {
+                self.tab_drag = None;
+                if off_bar {
+                    detach = Some(from);
+                } else if let Some(p) = pos {
+                    // The gap the pointer is in, counted with the dragged tab already lifted out.
+                    let slot = tabs.iter().filter(|(r, _)| r.center().x < p.x).count();
+                    let to = if slot > from { slot - 1 } else { slot };
+                    self.move_tab(from, to.min(self.tabs.len() - 1));
+                }
+            }
+        }
+        if let Some(i) = select {
+            self.switch_tab(i);
+        }
+        if let Some(i) = detach {
+            self.detach_tab(i);
+        } else if let Some(i) = close {
+            self.close_tab(i);
+        }
     }
 
     fn export(&mut self, mode: ExportMode, ask: bool) {
@@ -442,7 +779,7 @@ impl App {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let paths = match pick {
-                Pick::Open => d.pick_file().into_iter().collect(),
+                Pick::Open => d.pick_files().unwrap_or_default(),
                 Pick::Export(..) => d.save_file().into_iter().collect(),
                 Pick::Images(_) => d.pick_files().unwrap_or_default(),
             };
@@ -462,7 +799,7 @@ impl App {
         self.dialog = None;
         match pick {
             Pick::Open => {
-                if let Some(p) = paths.into_iter().next() {
+                for p in paths {
                     self.open(p);
                 }
             }
@@ -509,10 +846,27 @@ impl App {
         let msgs: Vec<Resp> = w.rx.try_iter().collect();
         for m in msgs {
             match m {
-                Resp::Opened { generation, pages } if generation == self.generation => self.on_opened(ctx, pages),
+                Resp::Opened { generation, pages } if generation == self.generation => self.on_opened(pages),
                 Resp::OpenFailed { generation, error } if generation == self.generation => {
                     self.status = format!("Could not open: {error}");
+                    self.status_until = f64::INFINITY;
                     self.path = None;
+                    self.lock = None;
+                }
+                // A document opened into a tab that is no longer the one showing.
+                Resp::Opened { generation, pages } => {
+                    if let Some(d) = self.tabs.iter_mut().find(|d| d.generation == generation && d.path.is_some()) {
+                        (d.page_y, d.doc_w, d.doc_h) = layout_pages(&pages);
+                        d.pages = pages;
+                        d.fit_pending = true;
+                    }
+                }
+                Resp::OpenFailed { generation, error } => {
+                    if let Some(i) = self.tabs.iter().position(|d| d.generation == generation && d.path.is_some()) {
+                        let name = self.tab_path(i).and_then(|p| p.file_name()).map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+                        self.close_tab(i);
+                        self.toast(format!("Could not open {name}: {error}"));
+                    }
                 }
                 Resp::Rendered { generation, page, scale, origin, layer, image } if generation == self.generation => {
                     let size = image.size;
@@ -671,6 +1025,7 @@ impl App {
         thumbs_wanted.retain(|&i| i < self.pages.len());
         {
             let mut keep = w.keep.lock().unwrap();
+            keep.generation = self.generation;
             keep.base = want.iter().copied().collect();
             keep.thumbs = thumbs_wanted.iter().copied().collect();
         }
@@ -770,7 +1125,7 @@ impl App {
     }
 
     fn color_idx(&self, tool: Tool) -> usize {
-        *self.tool_color.get(&tool).unwrap_or(&0)
+        *self.tool_color.get(&tool).unwrap_or(&DEFAULT_COLOR)
     }
 
     fn add(&mut self, page: usize, kind: Kind) -> u64 {
@@ -908,6 +1263,11 @@ impl App {
             }
             Kind::Arrow { a: p, b } | Kind::Line { a: p, b } => vec![(Handle::A, *p), (Handle::B, *b)],
             Kind::Pen { .. } => vec![],
+            Kind::Distance { a: p, b, off, .. } => {
+                let n = annot::dim_normal(*p, *b);
+                vec![(Handle::A, *p), (Handle::B, *b), (Handle::Offset, *p + (*b - *p) * 0.5 + n * *off)]
+            }
+            Kind::Area { pts, .. } | Kind::Perimeter { pts, .. } => pts.iter().enumerate().map(|(i, p)| (Handle::Vertex(i), *p)).collect(),
         }
     }
 
@@ -935,6 +1295,21 @@ impl App {
             }
             (Kind::Arrow { a, .. } | Kind::Line { a, .. }, Handle::A) => *a = p,
             (Kind::Arrow { b, .. } | Kind::Line { b, .. }, Handle::B) => *b = p,
+            (Kind::Distance { a, b, off, .. }, h) => match h {
+                // Keep the dimension line where it was while an end moves.
+                Handle::A | Handle::B => {
+                    let line = *a + annot::dim_normal(*a, *b) * *off;
+                    if matches!(h, Handle::A) { *a = p } else { *b = p }
+                    *off = (line - *a).dot(annot::dim_normal(*a, *b));
+                }
+                Handle::Offset => *off = (p - *a).dot(annot::dim_normal(*a, *b)),
+                _ => {}
+            },
+            (Kind::Area { pts, .. } | Kind::Perimeter { pts, .. }, Handle::Vertex(i)) => {
+                if let Some(v) = pts.get_mut(i) {
+                    *v = p;
+                }
+            }
             _ => {}
         }
     }
@@ -980,6 +1355,7 @@ impl App {
     fn set_tool(&mut self, t: Tool) {
         self.commit_edit();
         self.placing = None;
+        self.measuring = None;
         self.tool = t;
         if t != Tool::Select {
             self.selected.clear();
@@ -1006,12 +1382,123 @@ impl App {
 
     fn set_text_size(&mut self, s: f32) {
         self.text_size = s;
-        if self.lead_text_size().is_some() {
+        let mut sel = self.annots.iter().filter(|a| self.selected.contains(&a.id));
+        if sel.any(|a| a.text_size().is_some() || a.scale().is_some()) {
             self.edit_selected(|a| {
-                if let Kind::Callout { size, .. } | Kind::Text { size, .. } = &mut a.kind {
+                if let Some(size) = a.label_size_mut() {
                     *size = s;
                 }
             });
+        }
+    }
+
+    /// Scale for new measurements; also rescales any selected ones.
+    fn set_scale(&mut self, s: f32) {
+        self.prefs.scale = s;
+        self.prefs_dirty = true;
+        if self.annots.iter().any(|a| self.selected.contains(&a.id) && a.scale().is_some()) {
+            self.edit_selected(|a| {
+                if let Kind::Distance { scale, .. } | Kind::Area { scale, .. } | Kind::Perimeter { scale, .. } = &mut a.kind {
+                    *scale = s;
+                }
+            });
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Measuring
+
+    /// `p`, or with Shift held, `p` squared up horizontally or vertically from the last point.
+    fn snap(&self, p: Pos2) -> Pos2 {
+        let last = self.measuring.as_ref().and_then(|(_, pts)| match (self.tool, pts.len()) {
+            // The third click of a dimension sets its offset, not a point.
+            (Tool::Distance, 2) => None,
+            _ => pts.last().copied(),
+        });
+        match last {
+            Some(l) if self.ortho => {
+                let d = p - l;
+                if d.x.abs() >= d.y.abs() { pos2(p.x, l.y) } else { pos2(l.x, p.y) }
+            }
+            _ => p,
+        }
+    }
+
+    /// A click with a measuring tool. Distance: two points, then a third click
+    /// sets where the dimension line sits. Area / perimeter: a point per click,
+    /// finished by clicking the first point, double-clicking or Enter.
+    fn measure_click(&mut self, page: usize, p: Pos2, double: bool) {
+        if self.measuring.as_ref().is_some_and(|(pg, _)| *pg != page) {
+            return;
+        }
+        let p = self.snap(p);
+        let tol = HIT_PX / self.zoom;
+        let distance = self.tool == Tool::Distance;
+        let pts = &mut self.measuring.get_or_insert((page, Vec::new())).1;
+        let near_last = pts.last().is_some_and(|l| (p - *l).length() < tol);
+        let finish = if distance {
+            if !near_last || pts.len() == 2 {
+                pts.push(p);
+            }
+            (pts.len() == 3).then_some(false)
+        } else if pts.len() >= 3 && (p - pts[0]).length() < tol {
+            Some(true)
+        } else {
+            // A double-click's first click already put this point down.
+            if !near_last {
+                pts.push(p);
+            }
+            double.then_some(false)
+        };
+        if let Some(closed) = finish {
+            self.finish_measure(closed);
+        }
+    }
+
+    /// The measurement for the points so far, plus the pointer at `hover` if given.
+    fn measure_kind(&self, pts: &[Pos2], hover: Option<Pos2>, closed: bool) -> Option<Kind> {
+        let (scale, size) = (self.prefs.scale, self.text_size);
+        let mut all = pts.to_vec();
+        match self.tool {
+            Tool::Distance => {
+                let (a, b) = (*pts.first()?, pts.get(1).copied().or(hover)?);
+                let off = match (pts.get(2), hover) {
+                    (Some(c), _) => (*c - a).dot(annot::dim_normal(a, b)),
+                    (None, Some(h)) if pts.len() == 2 => (h - a).dot(annot::dim_normal(a, b)),
+                    _ => 0.0,
+                };
+                Some(Kind::Distance { a, b, off, scale, size })
+            }
+            Tool::Area | Tool::Perimeter => {
+                all.extend(hover);
+                match (self.tool, all.len()) {
+                    (_, 0 | 1) => None,
+                    (Tool::Area, 2) => Some(Kind::Perimeter { pts: all, closed: false, scale, size }),
+                    (Tool::Area, _) => Some(Kind::Area { pts: all, scale, size }),
+                    _ => Some(Kind::Perimeter { pts: all, closed, scale, size }),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Adds the measurement being drawn (Enter, a double-click, or closing it on its first point).
+    fn finish_measure(&mut self, closed: bool) {
+        let Some((page, pts)) = self.measuring.take() else { return };
+        let enough = match self.tool {
+            Tool::Distance => pts.len() >= 2 && (pts[1] - pts[0]).length() > 0.01,
+            Tool::Area => pts.len() >= 3,
+            _ => pts.len() >= 2,
+        };
+        if !enough {
+            self.toast(if self.tool == Tool::Area { "An area needs at least three points".into() } else { "Measurement cancelled".into() });
+            return;
+        }
+        let Some(kind) = self.measure_kind(&pts, None, closed) else { return };
+        self.snapshot();
+        let id = self.add(page, kind);
+        if let Some(a) = self.find(id) {
+            self.toast(format!("{}  ·  {}", a.label(), annot::scale_name(self.prefs.scale)));
         }
     }
 
@@ -1077,6 +1564,14 @@ impl App {
             if pressed(Key::Num0) {
                 self.fit_width();
             }
+            if pressed(Key::W) {
+                self.close_tab(self.active);
+            }
+            let n = self.tabs.len();
+            if pressed(Key::Tab) || pressed(Key::PageDown) || pressed(Key::PageUp) {
+                let back = pressed(Key::PageUp) || (pressed(Key::Tab) && shift);
+                self.switch_tab(if back { (self.active + n - 1) % n } else { (self.active + 1) % n });
+            }
             return;
         }
         if pressed(Key::O) && !self.pages.is_empty() {
@@ -1097,8 +1592,32 @@ impl App {
             self.toggle_right_panel(true);
         }
         for (t, _, k) in TOOLS {
-            if pressed(k) {
+            if pressed(k) && !shift {
                 self.set_tool(t);
+            }
+        }
+        for (t, _, k) in MEASURE_TOOLS {
+            if pressed(k) && shift {
+                self.set_tool(t);
+            }
+        }
+        if self.measuring.is_some() {
+            if pressed(Key::Escape) {
+                self.measuring = None;
+                return;
+            }
+            if pressed(Key::Enter) {
+                self.finish_measure(false);
+                return;
+            }
+            if pressed(Key::Backspace) || pressed(Key::Delete) {
+                if let Some((_, pts)) = &mut self.measuring {
+                    pts.pop();
+                    if pts.is_empty() {
+                        self.measuring = None;
+                    }
+                }
+                return;
             }
         }
         if pressed(Key::Escape) {
@@ -1207,6 +1726,7 @@ impl App {
             (i.pointer.hover_pos(), i.smooth_scroll_delta, i.zoom_delta(), i.key_down(Key::Space), i.pointer.press_origin(), i.pointer.latest_pos())
         });
         let mods = ctx.input(|i| Mods { add: i.modifiers.command || i.modifiers.shift, single: i.modifiers.alt });
+        self.ortho = ctx.input(|i| i.modifiers.shift);
         self.hover = hover.filter(|_| resp.hovered());
 
         if resp.hovered() {
@@ -1332,15 +1852,19 @@ impl App {
                 }
             }
             Tool::Pen => Drag::Pen { page, pts: vec![p] },
+            t if t.measures() => Drag::MeasurePoint { page, cur: p },
             _ => Drag::Create { page, start: p, cur: p },
         };
     }
 
     fn update_drag(&mut self, screen: Pos2, delta: Vec2) {
         let page = match &self.drag {
-            Drag::Create { page, .. } | Drag::Pen { page, .. } | Drag::Move { page, .. } | Drag::Marquee { page, .. } | Drag::Place { page, .. } => {
-                Some(*page)
-            }
+            Drag::Create { page, .. }
+            | Drag::Pen { page, .. }
+            | Drag::Move { page, .. }
+            | Drag::Marquee { page, .. }
+            | Drag::Place { page, .. }
+            | Drag::MeasurePoint { page, .. } => Some(*page),
             Drag::Handle { id, .. } => self.find(*id).map(|a| a.page),
             _ => None,
         };
@@ -1348,7 +1872,7 @@ impl App {
         let min_step = 1.0 / self.zoom;
         match &mut self.drag {
             Drag::Pan => self.offset -= delta / self.zoom,
-            Drag::Create { cur, .. } | Drag::Marquee { cur, .. } | Drag::Place { cur, .. } => *cur = p,
+            Drag::Create { cur, .. } | Drag::Marquee { cur, .. } | Drag::Place { cur, .. } | Drag::MeasurePoint { cur, .. } => *cur = p,
             Drag::Pen { pts, .. } => {
                 if pts.last().is_none_or(|l| (*l - p).length() >= min_step) {
                     pts.push(p);
@@ -1406,6 +1930,7 @@ impl App {
                 }
             }
             Drag::Place { page, start, cur } => self.place(page, start, cur),
+            Drag::MeasurePoint { page, cur } => self.measure_click(page, cur, false),
             _ => {}
         }
     }
@@ -1447,6 +1972,7 @@ impl App {
                 }
             }
             Tool::Callout | Tool::Text => self.create(page, p, p, false),
+            t if t.measures() => self.measure_click(page, p, double),
             _ => {
                 // Clicking an existing markup with a drawing tool selects it for quick edits.
                 if let Some(id) = self.hit(page, p) {
@@ -1494,7 +2020,7 @@ impl App {
             Tool::Highlight => Kind::Highlight { rect },
             Tool::Arrow => Kind::Arrow { a: start, b: end },
             Tool::Line => Kind::Line { a: start, b: end },
-            Tool::Select | Tool::Pen => return,
+            Tool::Select | Tool::Pen | Tool::Distance | Tool::Area | Tool::Perimeter => return,
         };
         self.snapshot();
         let is_text = matches!(kind, Kind::Callout { .. } | Kind::Text { .. });
@@ -1738,6 +2264,20 @@ impl App {
                 }
                 _ => {}
             }
+            // The measurement being drawn, to the pointer.
+            if let Some((page, pts)) = self.measuring.as_ref().filter(|(pg, _)| *pg == i) {
+                let hover = self.hover.filter(|h| self.page_at(*h) == Some(*page)).map(|h| self.snap(self.screen_to_page(*page, h)));
+                if let Some(kind) = self.measure_kind(pts, hover, false) {
+                    let a = Annot { id: 0, page: i, color: self.color(), width: self.width, kind, wrap_w: None, group: None };
+                    paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &a.prims(), k, 0.8, &self.textures);
+                }
+                for (n, p) in pts.iter().enumerate() {
+                    let c = self.page_to_screen(i, *p);
+                    // The first point of an area or perimeter: click it to close the shape.
+                    let r = if n == 0 && self.tool != Tool::Distance { 5.0 } else { 3.0 };
+                    pp.circle(c, r, Color32::WHITE, Stroke::new(1.5, SEL));
+                }
+            }
             // Where a stamp being placed will land: the drag so far, or centred on the pointer.
             if let Some(place) = &self.placing {
                 let at = match &self.drag {
@@ -1803,7 +2343,7 @@ impl App {
             Tool::Highlight => Kind::Highlight { rect },
             Tool::Arrow => Kind::Arrow { a: start, b: cur },
             Tool::Line => Kind::Line { a: start, b: cur },
-            Tool::Select | Tool::Pen => return None,
+            Tool::Select | Tool::Pen | Tool::Distance | Tool::Area | Tool::Perimeter => return None,
         })
     }
 
@@ -1902,6 +2442,30 @@ impl App {
                     self.set_tool(t);
                 }
             }
+            ui.separator();
+            for (t, label, k) in MEASURE_TOOLS {
+                let tip = match t {
+                    Tool::Distance => "Click two points, move to pull the dimension line off them, click to place",
+                    Tool::Area => "Click the corners; click the first point, double-click or Enter to finish",
+                    _ => "Click along the run; double-click or Enter to finish, click the first point to close it",
+                };
+                if ui.selectable_label(self.tool == t, format!("{label} Shift+{}", k.name())).on_hover_text(tip).clicked() {
+                    self.set_tool(t);
+                }
+            }
+            let cur_scale = self.lead().and_then(|a| a.scale()).unwrap_or(self.prefs.scale);
+            egui::ComboBox::from_id_salt("scale")
+                .width(110.0)
+                .selected_text(annot::scale_name(cur_scale))
+                .show_ui(ui, |ui| {
+                    for (s, name) in annot::SCALES {
+                        if ui.selectable_label((s - cur_scale).abs() < 1e-3, name).clicked() {
+                            self.set_scale(s);
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Drawing scale for measurements (applies to selected ones too). Assumes the PDF is at full sheet size.");
             ui.separator();
             let cur = self.lead().map(|a| a.color).unwrap_or(self.color());
             for (i, (c, name)) in COLORS.iter().enumerate() {
@@ -2382,7 +2946,7 @@ impl App {
         ui.separator();
         let mut order: Vec<&Annot> = self.annots.iter().collect();
         order.sort_by(|a, b| (a.page, a.bounds().min.y as i64, a.bounds().min.x as i64).cmp(&(b.page, b.bounds().min.y as i64, b.bounds().min.x as i64)));
-        let items: Vec<(u64, usize, Rgb, &'static str, String)> = order.iter().map(|a| (a.id, a.page, a.color, a.kind_name(), note_of(a).to_string())).collect();
+        let items: Vec<(u64, usize, Rgb, &'static str, String)> = order.iter().map(|a| (a.id, a.page, a.color, a.kind_name(), note_of(a))).collect();
         let mut clicked = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             let mut last_page = None;
@@ -2468,11 +3032,14 @@ impl App {
                     ("T", "Text box (click, or drag for width)"),
                     ("K / R / H", "Revision cloud / rectangle / highlight (drag)"),
                     ("A / L / P", "Arrow / line / pen"),
+                    ("Shift+D", "Distance: click two points, move to pull the dimension line off them, click to place"),
+                    ("Shift+A / Shift+P", "Area / perimeter: click points; click the first point, double-click or Enter to finish"),
+                    ("While measuring", "Shift squares up the segment · Backspace removes the last point · Esc cancels"),
                     ("V or Esc", "Select: drag to move, handles to resize, double-click or Enter to edit text"),
                     ("Ctrl/Shift+click", "Add to or remove from selection (also in the markup list)"),
                     ("Drag on empty page", "Select every markup the box crosses (Ctrl/Shift adds)   ·   Ctrl+A all on page"),
                     ("Esc / Ctrl+Enter", "Finish typing"),
-                    ("1–6", "Colour (applies to all selected)"),
+                    ("1–6", "Colour (applies to all selected; new markups start red)"),
                     ("[ ]", "Line width   ·   { } text size"),
                     ("Del", "Delete selection   ·   Ctrl+D duplicate"),
                     ("Ctrl+Z / Ctrl+Shift+Z", "Undo / redo"),
@@ -2484,6 +3051,8 @@ impl App {
                     ("Wheel / Ctrl+wheel", "Scroll / zoom at cursor"),
                     ("Middle or right drag, Space+drag", "Pan"),
                     ("W / F / G", "Fit width / fit page / go to page"),
+                    ("Ctrl+O / Ctrl+W", "Open PDFs in new tabs / close the tab"),
+                    ("Ctrl+Tab / Ctrl+PgDn PgUp", "Next / previous tab   ·   drag a tab off the bar (or right-click it) for a new window"),
                     ("PgUp PgDn ← →  Home End", "Previous / next page"),
                     ("Arrows with a selection", "Nudge it 1 pixel at the current zoom (Shift: 10)"),
                 ];
@@ -2526,11 +3095,23 @@ impl eframe::App for App {
         self.poll_worker(&ctx);
         self.poll_dialog();
 
-        if let Some(p) = ctx.input(|i| i.raw.dropped_files.iter().next().map(|f| f.path().to_path_buf())) {
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
+        for p in dropped {
             self.open(p);
+        }
+        let title = match self.file_name() {
+            n if n.is_empty() => "Greenline".to_string(),
+            n => format!("{n} — Greenline"),
+        };
+        if title != self.title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
         }
 
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
+        if self.tabs.len() > 1 || self.path.is_some() {
+            egui::Panel::top("tabs").show(ui, |ui| self.tab_bar(ui));
+        }
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui, now));
         let has_doc = !self.pages.is_empty();
         let sheets = crate::theme::sheets(ui.visuals());
@@ -2601,6 +3182,11 @@ impl eframe::App for App {
     fn on_exit(&mut self) {
         self.commit_edit();
         self.save_sidecar();
+        for d in self.tabs.iter().filter(|d| d.dirty && !d.read_only) {
+            if let Some(p) = &d.path {
+                let _ = sidecar::save(p, &d.annots);
+            }
+        }
     }
 }
 
@@ -2682,11 +3268,11 @@ fn default_author() -> String {
     }
 }
 
-/// The note text, or a stamp's name: what the markup list and CSV show.
-fn note_of(a: &Annot) -> &str {
+/// The note text, a stamp's name, or a measurement's value: what the markup list and CSV show.
+fn note_of(a: &Annot) -> String {
     match &a.kind {
-        Kind::Image { name, .. } => name,
-        _ => a.text(),
+        Kind::Image { name, .. } => name.clone(),
+        _ => a.measure_text().unwrap_or_else(|| a.text().to_string()),
     }
 }
 
@@ -2865,6 +3451,83 @@ mod tests {
         let d = app.annots.last().unwrap();
         assert_eq!((d.text(), d.color), ("10/29/2026", DATE_COLOR));
         assert!((d.bounds().center() - pos2(200.0, 500.0)).length() < 0.5, "centred on the click");
+    }
+
+    #[test]
+    fn every_tool_starts_red() {
+        let mut app = app();
+        for t in [Tool::Callout, Tool::Rect, Tool::Highlight, Tool::Pen, Tool::Distance, Tool::Area] {
+            app.set_tool(t);
+            assert_eq!(app.color(), [228, 0, 0], "{t:?}");
+        }
+        app.set_tool(Tool::Rect);
+        app.set_color(2);
+        assert_eq!(app.color(), COLORS[2].0, "a choice sticks per tool");
+        app.set_tool(Tool::Line);
+        assert_eq!(app.color(), [228, 0, 0]);
+    }
+
+    #[test]
+    fn distance_two_points_then_offset_click() {
+        let mut app = app();
+        app.set_tool(Tool::Distance);
+        app.prefs.scale = 48.0;
+        app.click(pos2(100.0, 400.0), false, PLAIN);
+        app.click(pos2(244.0, 400.0), false, PLAIN);
+        assert!(app.annots.is_empty(), "two clicks set the points");
+        app.click(pos2(170.0, 360.0), false, PLAIN);
+        let a = app.annots.last().unwrap();
+        assert!(matches!(a.kind, Kind::Distance { off, .. } if (off + 40.0).abs() < 1e-3), "{:?}", a.kind);
+        assert_eq!(a.measure_text().unwrap(), "8'-0\"", "2 paper inches at 1/4\"");
+        assert!(app.measuring.is_none() && app.tool == Tool::Distance, "ready for the next one");
+        // A press-drag-release counts as a click too.
+        drag(&mut app, pos2(100.0, 500.0), pos2(101.0, 500.0), PLAIN);
+        assert_eq!(app.measuring.as_ref().unwrap().1.len(), 1);
+    }
+
+    #[test]
+    fn area_closes_on_first_point_perimeter_on_double_click() {
+        let mut app = app();
+        app.set_tool(Tool::Area);
+        app.prefs.scale = 96.0;
+        for p in [pos2(100.0, 100.0), pos2(172.0, 100.0), pos2(172.0, 244.0), pos2(100.0, 244.0), pos2(101.0, 101.0)] {
+            app.click(p, false, PLAIN);
+        }
+        assert_eq!(app.annots.last().unwrap().measure_text().unwrap(), "128.0 SF");
+        app.set_tool(Tool::Perimeter);
+        app.click(pos2(100.0, 300.0), false, PLAIN);
+        app.click(pos2(172.0, 300.0), false, PLAIN);
+        app.click(pos2(172.0, 300.0), true, PLAIN);
+        let p = app.annots.last().unwrap();
+        assert!(matches!(&p.kind, Kind::Perimeter { pts, closed: false, .. } if pts.len() == 2));
+        assert_eq!(p.measure_text().unwrap(), "8'-0\"");
+        app.undo();
+        assert_eq!(app.annots.len(), 1, "one undo step per measurement");
+    }
+
+    #[test]
+    fn tabs_keep_their_own_markups_and_view() {
+        let mut app = app();
+        app.path = Some(PathBuf::from("/a.pdf"));
+        let a = rect(&mut app, 100.0, 100.0);
+        app.zoom = 2.0;
+        app.tabs.push(Doc::new());
+        app.switch_tab(1);
+        assert!(app.annots.is_empty() && app.path.is_none() && app.zoom == 1.0, "a fresh tab");
+        app.path = Some(PathBuf::from("/b.pdf"));
+        app.pages = vec![vec2(300.0, 300.0)];
+        app.page_y = vec![0.0];
+        rect(&mut app, 50.0, 50.0);
+        rect(&mut app, 60.0, 60.0);
+        app.switch_tab(0);
+        assert_eq!((app.annots.len(), app.annots[0].id, app.zoom), (1, a, 2.0));
+        assert_eq!(app.tab_path(1), Some(&PathBuf::from("/b.pdf")));
+        app.move_tab(0, 1);
+        assert_eq!((app.active, app.tab_path(0)), (1, Some(&PathBuf::from("/b.pdf"))), "the shown doc moves with its tab");
+        assert!(app.close_tab(0));
+        assert_eq!((app.tabs.len(), app.active, app.annots.len()), (1, 0, 1));
+        assert!(app.close_tab(0));
+        assert!(app.path.is_none() && app.annots.is_empty() && app.tabs.len() == 1, "back to an empty window");
     }
 
     #[test]
